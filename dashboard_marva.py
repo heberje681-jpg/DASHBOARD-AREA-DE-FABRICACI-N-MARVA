@@ -74,6 +74,23 @@ def buscar_leer(models, uid, modelo, dominio, campos, limite=0, orden=""):
     )
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def campos_disponibles(modelo):
+    """Nombres de campo reales que existen en este modelo (varía entre versiones de Odoo)."""
+    uid, models = conectar_odoo()
+    info = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, modelo, "fields_get", [], {"attributes": ["string"]})
+    return set(info.keys())
+
+
+def primer_campo_valido(modelo, candidatos):
+    """Regresa el primer nombre de campo de la lista que sí existe en este modelo, o None."""
+    disponibles = campos_disponibles(modelo)
+    for c in candidatos:
+        if c in disponibles:
+            return c
+    return None
+
+
 # ============================================================
 # EXTRACCIÓN DE DATOS (con caché corta para no saturar Odoo)
 # ============================================================
@@ -81,25 +98,50 @@ def buscar_leer(models, uid, modelo, dominio, campos, limite=0, orden=""):
 def get_ordenes_fabricacion():
     """Órdenes de fabricación (mrp.production) activas y recientes."""
     uid, models = conectar_odoo()
-    campos = [
-        "name", "product_id", "product_qty", "qty_producing",
-        "state", "date_planned_start", "date_planned_finished",
-        "date_start", "date_finished", "origin",
-        "user_id", "company_id", "bom_id", "workorder_ids",
-    ]
+
+    campo_inicio_pl = primer_campo_valido("mrp.production", ["date_planned_start", "date_start"])
+    campo_fin_pl = primer_campo_valido("mrp.production", ["date_planned_finished", "date_finished", "date_deadline"])
+    campo_inicio_real = primer_campo_valido("mrp.production", ["date_start", "date_planned_start_wo"])
+    campo_fin_real = primer_campo_valido("mrp.production", ["date_finished", "date_planned_finished"])
+
+    campos_fijos = ["name", "product_id", "product_qty", "qty_producing", "state",
+                     "origin", "user_id", "company_id", "bom_id", "workorder_ids"]
+    campos_fecha = {c for c in [campo_inicio_pl, campo_fin_pl, campo_inicio_real, campo_fin_real] if c}
+    disponibles = campos_disponibles("mrp.production")
+    campos_reales = [c for c in campos_fijos if c in disponibles] + list(campos_fecha)
+
     dominio = [("state", "in", ["confirmed", "progress", "to_close", "planned"])]
-    data = buscar_leer(models, uid, "mrp.production", dominio, campos, orden="date_planned_start asc")
-    return pd.DataFrame(data)
+    orden = f"{campo_inicio_pl} asc" if campo_inicio_pl else ""
+    data = buscar_leer(models, uid, "mrp.production", dominio, campos_reales, orden=orden)
+    df = pd.DataFrame(data)
+    if df.empty:
+        return df
+
+    # Mapear cada campo real encontrado a los nombres canónicos que usa el resto del dashboard
+    df["date_planned_start"] = df[campo_inicio_pl] if campo_inicio_pl in df.columns else pd.NA
+    df["date_planned_finished"] = df[campo_fin_pl] if campo_fin_pl in df.columns else pd.NA
+    df["date_start"] = df[campo_inicio_real] if campo_inicio_real in df.columns else pd.NA
+    df["date_finished"] = df[campo_fin_real] if campo_fin_real in df.columns else pd.NA
+    return df
 
 
 @st.cache_data(ttl=30, show_spinner=False)
 def get_ordenes_terminadas_hoy():
     uid, models = conectar_odoo()
+    campo_fin = primer_campo_valido("mrp.production", ["date_finished", "date_planned_finished"])
     hoy = datetime.now().strftime("%Y-%m-%d 00:00:00")
-    campos = ["name", "product_id", "product_qty", "qty_producing", "date_finished", "state"]
-    dominio = [("state", "=", "done"), ("date_finished", ">=", hoy)]
+    campos = ["name", "product_id", "product_qty", "qty_producing", "state"]
+    if campo_fin:
+        campos.append(campo_fin)
+        dominio = [("state", "=", "done"), (campo_fin, ">=", hoy)]
+    else:
+        dominio = [("state", "=", "done"), ("write_date", ">=", hoy)]
     data = buscar_leer(models, uid, "mrp.production", dominio, campos)
-    return pd.DataFrame(data)
+    df = pd.DataFrame(data)
+    if df.empty:
+        return df
+    df["date_finished"] = df[campo_fin] if campo_fin and campo_fin in df.columns else pd.NA
+    return df
 
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -108,13 +150,23 @@ def get_workorders(orden_ids):
     if not orden_ids:
         return pd.DataFrame()
     uid, models = conectar_odoo()
-    campos = [
-        "name", "production_id", "workcenter_id", "state",
-        "duration_expected", "duration", "date_start", "date_finished",
-    ]
+
+    campo_inicio = primer_campo_valido("mrp.workorder", ["date_start", "date_planned_start"])
+    campo_fin = primer_campo_valido("mrp.workorder", ["date_finished", "date_planned_finished"])
+
+    campos_fijos = ["name", "production_id", "workcenter_id", "state", "duration_expected", "duration"]
+    campos_fecha = {c for c in [campo_inicio, campo_fin] if c}
+    disponibles = campos_disponibles("mrp.workorder")
+    campos_reales = [c for c in campos_fijos if c in disponibles] + list(campos_fecha)
+
     dominio = [("production_id", "in", orden_ids)]
-    data = buscar_leer(models, uid, "mrp.workorder", dominio, campos)
-    return pd.DataFrame(data)
+    data = buscar_leer(models, uid, "mrp.workorder", dominio, campos_reales)
+    df = pd.DataFrame(data)
+    if df.empty:
+        return df
+    df["date_start"] = df[campo_inicio] if campo_inicio in df.columns else pd.NA
+    df["date_finished"] = df[campo_fin] if campo_fin in df.columns else pd.NA
+    return df
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -252,6 +304,21 @@ def nombre_relacion(campo):
     return campo[1] if isinstance(campo, (list, tuple)) and len(campo) > 1 else campo
 
 
+def intentar(func, *args, etiqueta="esta sección", **kwargs):
+    """Corre una función de extracción de datos; si Odoo truena por un campo
+    que no existe en esta versión/instalación, muestra un aviso corto en vez
+    de tumbar todo el dashboard."""
+    try:
+        return func(*args, **kwargs)
+    except xmlrpc.client.Fault as e:
+        mensaje = str(e.faultString).strip().split("\n")[-1] if e.faultString else str(e)
+        st.warning(f"No se pudo cargar {etiqueta}: {mensaje[:200]}")
+        return pd.DataFrame()
+    except Exception as e:
+        st.warning(f"No se pudo cargar {etiqueta}: {e}")
+        return pd.DataFrame()
+
+
 # ============================================================
 # UI
 # ============================================================
@@ -276,22 +343,23 @@ except Exception as e:
     )
     st.stop()
 
-df_ordenes = get_ordenes_fabricacion()
-df_terminadas_hoy = get_ordenes_terminadas_hoy()
+df_ordenes = intentar(get_ordenes_fabricacion, etiqueta="las órdenes de fabricación")
+df_terminadas_hoy = intentar(get_ordenes_terminadas_hoy, etiqueta="las órdenes terminadas hoy")
 df_atrasadas = get_ordenes_atrasadas(df_ordenes)
 
 if not df_ordenes.empty:
     orden_ids = df_ordenes["id"].tolist()
-    df_workorders = get_workorders(orden_ids)
+    df_workorders = intentar(get_workorders, orden_ids, etiqueta="las órdenes de trabajo")
 else:
+    orden_ids = []
     df_workorders = pd.DataFrame()
 
-df_centros = get_centros_trabajo()
-df_calidad = get_alertas_calidad()
+df_centros = intentar(get_centros_trabajo, etiqueta="los centros de trabajo")
+df_calidad = intentar(get_alertas_calidad, etiqueta="las alertas de calidad")
 
 # ---------- Costos ----------
-df_consumo = get_consumo_materiales(orden_ids) if not df_ordenes.empty else pd.DataFrame()
-df_costo_planeado = get_costo_planeado_materiales(df_ordenes)
+df_consumo = intentar(get_consumo_materiales, orden_ids, etiqueta="el consumo de materiales") if orden_ids else pd.DataFrame()
+df_costo_planeado = intentar(get_costo_planeado_materiales, df_ordenes, etiqueta="el costo planeado (BOM)")
 df_costo_mo = get_costo_mano_obra(df_workorders, df_centros)
 
 costo_material_real_total = df_consumo["costo_real"].sum() if not df_consumo.empty else 0
