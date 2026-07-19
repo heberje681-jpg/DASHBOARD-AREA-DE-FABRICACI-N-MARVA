@@ -29,13 +29,99 @@ import plotly.express as px
 import streamlit as st
 
 # ============================================================
+# IDENTIDAD VISUAL — Marva Silos y Construcción
+# ============================================================
+# Logo y favicon oficiales, tomados de marvasilos.com
+LOGO_URL = "https://marvasilos.com/wp-content/uploads/2024/06/Logo.svg"
+FAVICON_URL = "https://marvasilos.com/wp-content/uploads/2024/06/cropped-Favicon-270x270.png"
+
+# Paleta: azul acero / marino (estructura, confianza) + ámbar (grano, calidez de marca).
+# No hay una guía de marca pública con hex exactos, así que esta paleta está inspirada
+# en la estética industrial/agro del sitio. Si tienes los códigos de color oficiales de
+# Marva, dímelos y ajusto esto para que sea pixel-perfect.
+COLOR_PRIMARIO = "#D98E2B"      # ámbar / grano — acentos, botones, KPIs destacados
+COLOR_FONDO = "#0E1B2A"         # azul marino muy oscuro — fondo principal
+COLOR_FONDO_SEC = "#16283D"     # azul acero — tarjetas, sidebar, contenedores
+COLOR_TEXTO = "#E8EDF2"         # gris muy claro — texto principal
+
+# ============================================================
 # CONFIGURACIÓN
 # ============================================================
 st.set_page_config(
-    page_title="Dashboard de Piso - Marva",
+    page_title="Dashboard de Piso · Marva Silos y Construcción",
     layout="wide",
-    page_icon="🏭",
+    page_icon=FAVICON_URL,
 )
+
+st.markdown(f"""
+<style>
+    .stApp {{
+        background-color: {COLOR_FONDO};
+        color: {COLOR_TEXTO};
+    }}
+    /* Encabezado con logo */
+    .marva-header {{
+        display: flex;
+        align-items: center;
+        gap: 20px;
+        padding: 18px 24px;
+        background: linear-gradient(90deg, {COLOR_FONDO_SEC} 0%, {COLOR_FONDO} 100%);
+        border-radius: 12px;
+        border-left: 5px solid {COLOR_PRIMARIO};
+        margin-bottom: 20px;
+    }}
+    .marva-header img {{ height: 42px; }}
+    .marva-header .titulo {{ font-size: 1.5rem; font-weight: 700; color: {COLOR_TEXTO}; margin: 0; }}
+    .marva-header .subtitulo {{ font-size: 0.85rem; color: #9FB2C4; margin: 0; }}
+
+    /* Tarjetas de KPI */
+    div[data-testid="stMetric"] {{
+        background-color: {COLOR_FONDO_SEC};
+        border: 1px solid #223347;
+        border-left: 4px solid {COLOR_PRIMARIO};
+        border-radius: 10px;
+        padding: 14px 16px 8px 16px;
+    }}
+    div[data-testid="stMetric"] label {{ color: #9FB2C4 !important; }}
+    div[data-testid="stMetricValue"] {{ color: {COLOR_TEXTO} !important; }}
+
+    /* Pestañas */
+    .stTabs [data-baseweb="tab-list"] {{ gap: 4px; }}
+    .stTabs [data-baseweb="tab"] {{
+        background-color: {COLOR_FONDO_SEC};
+        border-radius: 8px 8px 0 0;
+        padding: 8px 16px;
+        color: #9FB2C4;
+    }}
+    .stTabs [aria-selected="true"] {{
+        background-color: {COLOR_PRIMARIO} !important;
+        color: {COLOR_FONDO} !important;
+        font-weight: 600;
+    }}
+
+    /* Botones */
+    .stButton button {{
+        background-color: {COLOR_PRIMARIO};
+        color: {COLOR_FONDO};
+        border: none;
+        font-weight: 600;
+    }}
+    .stButton button:hover {{ opacity: 0.85; color: {COLOR_FONDO}; }}
+
+    /* Tablas */
+    div[data-testid="stDataFrame"] {{ border: 1px solid #223347; border-radius: 8px; }}
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown(f"""
+<div class="marva-header">
+    <img src="{LOGO_URL}" alt="Marva Silos y Construcción">
+    <div>
+        <p class="titulo">Dashboard de Piso — Fabricación</p>
+        <p class="subtitulo">Marva Silos y Construcción · Datos en vivo desde Odoo</p>
+    </div>
+</div>
+""", unsafe_allow_html=True)
 
 def _get_config(key, default=""):
     """Busca primero en st.secrets, si no existe usa el default de abajo."""
@@ -319,12 +405,30 @@ def intentar(func, *args, etiqueta="esta sección", **kwargs):
         return pd.DataFrame()
 
 
+def estilizar_grafica(fig):
+    """Aplica la paleta de Marva (fondo oscuro + acentos ámbar) a una gráfica de Plotly."""
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor=COLOR_FONDO_SEC,
+        plot_bgcolor=COLOR_FONDO_SEC,
+        font_color=COLOR_TEXTO,
+        title_font_color=COLOR_TEXTO,
+        legend_title_font_color=COLOR_TEXTO,
+        margin=dict(t=50, l=10, r=10, b=10),
+    )
+    fig.update_xaxes(gridcolor="#223347")
+    fig.update_yaxes(gridcolor="#223347")
+    paleta = [COLOR_PRIMARIO, "#4A7FA6", "#7FA65C", "#C0553B", "#9FB2C4", "#E8C468"]
+    fig.update_traces(marker_color=paleta[0]) if len(fig.data) == 1 and hasattr(fig.data[0], "marker") else None
+    for i, trace in enumerate(fig.data):
+        if hasattr(trace, "marker") and trace.marker.color is None:
+            trace.marker.color = paleta[i % len(paleta)]
+    return fig
+
+
 # ============================================================
 # UI
 # ============================================================
-st.title("🏭 Dashboard de Piso — Marva Silos y Construcción")
-st.caption("Datos en vivo desde Odoo · Actualiza automáticamente cada 30 segundos")
-
 col_refresh, col_status = st.columns([1, 5])
 with col_refresh:
     if st.button("🔄 Actualizar ahora"):
@@ -358,18 +462,14 @@ df_centros = intentar(get_centros_trabajo, etiqueta="los centros de trabajo")
 df_calidad = intentar(get_alertas_calidad, etiqueta="las alertas de calidad")
 
 # ---------- Costos ----------
-df_consumo = intentar(get_consumo_materiales, orden_ids, etiqueta="el consumo de materiales") if orden_ids else pd.DataFrame()
 df_costo_planeado = intentar(get_costo_planeado_materiales, df_ordenes, etiqueta="el costo planeado (BOM)")
 df_costo_mo = get_costo_mano_obra(df_workorders, df_centros)
 
-costo_material_real_total = df_consumo["costo_real"].sum() if not df_consumo.empty else 0
 costo_material_planeado_total = df_costo_planeado["costo_planeado"].sum() if not df_costo_planeado.empty else 0
 costo_mano_obra_total = df_costo_mo["costo_mano_obra"].sum() if not df_costo_mo.empty else 0
-costo_total_produccion = costo_material_real_total + costo_mano_obra_total
-desviacion_material_pct = (
-    ((costo_material_real_total - costo_material_planeado_total) / costo_material_planeado_total * 100)
-    if costo_material_planeado_total else 0
-)
+costo_total_produccion = costo_material_planeado_total + costo_mano_obra_total
+piezas_producidas_total = df_ordenes["qty_producing"].sum() if not df_ordenes.empty else 0
+costo_por_pieza = (costo_total_produccion / piezas_producidas_total) if piezas_producidas_total else 0
 
 # ---------- KPIs ----------
 k1, k2, k3, k4, k5 = st.columns(5)
@@ -380,11 +480,10 @@ k4.metric("Terminadas hoy", len(df_terminadas_hoy))
 k5.metric("Alertas de calidad abiertas", len(df_calidad))
 
 k6, k7, k8, k9 = st.columns(4)
-k6.metric("Costo materiales (real)", f"${costo_material_real_total:,.0f}")
+k6.metric("Costo materiales (BOM)", f"${costo_material_planeado_total:,.0f}")
 k7.metric("Costo mano de obra (real)", f"${costo_mano_obra_total:,.0f}")
 k8.metric("Costo total de producción", f"${costo_total_produccion:,.0f}")
-k9.metric("Desviación vs. costo BOM", f"{desviacion_material_pct:+.1f}%",
-          delta=f"{desviacion_material_pct:+.1f}%", delta_color="inverse")
+k9.metric("Costo total por pieza", f"${costo_por_pieza:,.2f}" if piezas_producidas_total else "N/A")
 
 st.divider()
 
@@ -428,7 +527,7 @@ with tab2:
         carga = wo.groupby(["Centro", "state"]).size().reset_index(name="Cantidad")
         fig = px.bar(carga, x="Centro", y="Cantidad", color="state", barmode="stack",
                      title="Órdenes de trabajo por centro y estado")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(estilizar_grafica(fig), use_container_width=True)
 
         if not df_centros.empty:
             st.dataframe(
@@ -463,44 +562,51 @@ with tab3:
 
 # ---------- TAB 4: Costos ----------
 with tab4:
-    st.subheader("Costo real vs. costo planeado (BOM) por orden")
+    st.subheader("Costo de producción por orden")
     st.caption(
-        "El costo real de materiales usa el costo estándar del producto (standard_price) "
-        "al momento de consultar — es una buena aproximación, pero si Marva usa costeo FIFO "
-        "o promedio ponderado, el valor contable exacto puede diferir un poco."
+        "Materiales = costo estimado según la receta (BOM) de cada producto, ya que el "
+        "inventario real se controla en otro sistema. Mano de obra = horas reales del "
+        "workorder × costo-hora del centro de trabajo (máquina + operador) configurado en Odoo."
     )
-    if df_consumo.empty and df_costo_planeado.empty:
-        st.info("Aún no hay consumo de materiales registrado en las órdenes activas.")
+    if df_costo_planeado.empty and df_costo_mo.empty:
+        st.info("Aún no hay órdenes con receta (BOM) o tiempos registrados.")
     else:
-        resumen_real = (
-            df_consumo.groupby(["orden_id", "orden"]).agg(costo_material_real=("costo_real", "sum")).reset_index()
-            if not df_consumo.empty else pd.DataFrame(columns=["orden_id", "orden", "costo_material_real"])
-        )
         resumen = df_costo_planeado.rename(columns={"id": "orden_id", "name": "orden"}) if not df_costo_planeado.empty else pd.DataFrame(columns=["orden_id", "orden", "costo_planeado"])
-        resumen = resumen.merge(resumen_real, on=["orden_id", "orden"], how="outer")
         if not df_costo_mo.empty:
             resumen = resumen.merge(df_costo_mo, on=["orden_id", "orden"], how="outer")
         resumen = resumen.fillna(0)
-        resumen["costo_total_real"] = resumen.get("costo_material_real", 0) + resumen.get("costo_mano_obra", 0)
-        resumen["desviacion_%"] = (
-            (resumen.get("costo_material_real", 0) - resumen.get("costo_planeado", 0))
-            / resumen.get("costo_planeado", pd.Series([1] * len(resumen))).replace(0, 1) * 100
-        ).round(1)
+        resumen["costo_total"] = resumen.get("costo_planeado", 0) + resumen.get("costo_mano_obra", 0)
+
+        if not df_ordenes.empty:
+            piezas = df_ordenes[["id", "qty_producing"]].rename(columns={"id": "orden_id"})
+            resumen = resumen.merge(piezas, on="orden_id", how="left")
+            resumen["qty_producing"] = resumen["qty_producing"].fillna(0)
+            resumen["costo_por_pieza"] = resumen.apply(
+                lambda r: r["costo_total"] / r["qty_producing"] if r["qty_producing"] > 0 else None, axis=1
+            )
 
         tabla_costos = resumen.rename(columns={
-            "orden": "Orden", "costo_planeado": "Materiales Planeado (BOM)",
-            "costo_material_real": "Materiales Real", "costo_mano_obra": "Mano de Obra Real",
-            "costo_total_real": "Costo Total Real", "desviacion_%": "Desviación Materiales %",
+            "orden": "Orden", "costo_planeado": "Materiales (BOM)",
+            "costo_mano_obra": "Mano de Obra", "costo_total": "Costo Total",
+            "qty_producing": "Piezas Producidas", "costo_por_pieza": "Costo por Pieza",
         }).drop(columns=["orden_id"], errors="ignore")
         st.dataframe(tabla_costos, use_container_width=True, hide_index=True)
 
-        if not df_consumo.empty:
-            st.markdown("**Top materiales consumidos (todas las órdenes activas)**")
-            top_materiales = df_consumo.groupby("Producto").agg(
-                cantidad=("cantidad", "sum"), costo=("costo_real", "sum")
-            ).reset_index().sort_values("costo", ascending=False).head(10)
-            fig_mat = px.bar(top_materiales, x="Producto", y="costo", title="Costo de materiales por producto")
-            st.plotly_chart(fig_mat, use_container_width=True)
+        st.markdown("**Desglose de mano de obra por centro de trabajo**")
+        if not df_workorders.empty and not df_centros.empty:
+            wo = df_workorders.copy()
+            wo["Centro"] = wo["workcenter_id"].apply(nombre_relacion)
+            centros_costo = df_centros.rename(columns={"id": "centro_id", "costs_hour": "costo_hora"})
+            wo["centro_id"] = wo["workcenter_id"].apply(lambda x: x[0] if isinstance(x, (list, tuple)) else x)
+            wo = wo.merge(centros_costo[["centro_id", "costo_hora"]], on="centro_id", how="left")
+            wo["costo"] = (wo["duration"] / 60.0) * wo["costo_hora"].fillna(0)
+            por_centro = wo.groupby("Centro").agg(
+                horas_reales=("duration", lambda s: s.sum() / 60.0), costo=("costo", "sum")
+            ).reset_index()
+            fig_centro = px.bar(por_centro, x="Centro", y="costo", title="Costo de mano de obra por centro de trabajo")
+            st.plotly_chart(estilizar_grafica(fig_centro), use_container_width=True)
+        else:
+            st.info("Aún no hay horas registradas en órdenes de trabajo.")
 
 # ---------- TAB 5: Calidad ----------
 with tab5:
