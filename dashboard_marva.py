@@ -35,14 +35,14 @@ import streamlit as st
 LOGO_URL = "https://marvasilos.com/wp-content/uploads/2024/06/Logo.svg"
 FAVICON_URL = "https://marvasilos.com/wp-content/uploads/2024/06/cropped-Favicon-270x270.png"
 
-# Paleta: azul acero / marino (estructura, confianza) + ámbar (grano, calidez de marca).
-# No hay una guía de marca pública con hex exactos, así que esta paleta está inspirada
-# en la estética industrial/agro del sitio. Si tienes los códigos de color oficiales de
-# Marva, dímelos y ajusto esto para que sea pixel-perfect.
-COLOR_PRIMARIO = "#D98E2B"      # ámbar / grano — acentos, botones, KPIs destacados
-COLOR_FONDO = "#0E1B2A"         # azul marino muy oscuro — fondo principal
-COLOR_FONDO_SEC = "#16283D"     # azul acero — tarjetas, sidebar, contenedores
-COLOR_TEXTO = "#E8EDF2"         # gris muy claro — texto principal
+# Paleta clara: fondo blanco/gris-azulado + azul acero como acento.
+# Si tienes los códigos de color oficiales de Marva, dímelos y los pongo exactos.
+COLOR_PRIMARIO = "#16537E"      # azul acero — acentos, botones, KPIs destacados
+COLOR_FONDO = "#F5F8FA"         # blanco grisáceo — fondo principal
+COLOR_FONDO_SEC = "#E7EEF4"     # gris-azulado claro — tarjetas, contenedores
+COLOR_TEXTO = "#1B2B3A"         # azul marino oscuro — texto principal (buen contraste en claro)
+COLOR_BORDE = "#D3DFE8"         # gris-azulado — bordes y líneas de cuadrícula
+COLOR_TEXTO_SUAVE = "#5A7A94"   # azul grisáceo — texto secundario, etiquetas
 
 # ============================================================
 # CONFIGURACIÓN
@@ -72,17 +72,17 @@ st.markdown(f"""
     }}
     .marva-header img {{ height: 42px; }}
     .marva-header .titulo {{ font-size: 1.5rem; font-weight: 700; color: {COLOR_TEXTO}; margin: 0; }}
-    .marva-header .subtitulo {{ font-size: 0.85rem; color: #9FB2C4; margin: 0; }}
+    .marva-header .subtitulo {{ font-size: 0.85rem; color: {COLOR_TEXTO_SUAVE}; margin: 0; }}
 
     /* Tarjetas de KPI */
     div[data-testid="stMetric"] {{
         background-color: {COLOR_FONDO_SEC};
-        border: 1px solid #223347;
+        border: 1px solid {COLOR_BORDE};
         border-left: 4px solid {COLOR_PRIMARIO};
         border-radius: 10px;
         padding: 14px 16px 8px 16px;
     }}
-    div[data-testid="stMetric"] label {{ color: #9FB2C4 !important; }}
+    div[data-testid="stMetric"] label {{ color: {COLOR_TEXTO_SUAVE} !important; }}
     div[data-testid="stMetricValue"] {{ color: {COLOR_TEXTO} !important; }}
 
     /* Pestañas */
@@ -91,7 +91,7 @@ st.markdown(f"""
         background-color: {COLOR_FONDO_SEC};
         border-radius: 8px 8px 0 0;
         padding: 8px 16px;
-        color: #9FB2C4;
+        color: {COLOR_TEXTO_SUAVE};
     }}
     .stTabs [aria-selected="true"] {{
         background-color: {COLOR_PRIMARIO} !important;
@@ -109,7 +109,7 @@ st.markdown(f"""
     .stButton button:hover {{ opacity: 0.85; color: {COLOR_FONDO}; }}
 
     /* Tablas */
-    div[data-testid="stDataFrame"] {{ border: 1px solid #223347; border-radius: 8px; }}
+    div[data-testid="stDataFrame"] {{ border: 1px solid {COLOR_BORDE}; border-radius: 8px; }}
 </style>
 """, unsafe_allow_html=True)
 
@@ -408,7 +408,7 @@ def intentar(func, *args, etiqueta="esta sección", **kwargs):
 def estilizar_grafica(fig):
     """Aplica la paleta de Marva (fondo oscuro + acentos ámbar) a una gráfica de Plotly."""
     fig.update_layout(
-        template="plotly_dark",
+        template="plotly_white",
         paper_bgcolor=COLOR_FONDO_SEC,
         plot_bgcolor=COLOR_FONDO_SEC,
         font_color=COLOR_TEXTO,
@@ -416,9 +416,9 @@ def estilizar_grafica(fig):
         legend_title_font_color=COLOR_TEXTO,
         margin=dict(t=50, l=10, r=10, b=10),
     )
-    fig.update_xaxes(gridcolor="#223347")
-    fig.update_yaxes(gridcolor="#223347")
-    paleta = [COLOR_PRIMARIO, "#4A7FA6", "#7FA65C", "#C0553B", "#9FB2C4", "#E8C468"]
+    fig.update_xaxes(gridcolor=COLOR_BORDE)
+    fig.update_yaxes(gridcolor=COLOR_BORDE)
+    paleta = [COLOR_PRIMARIO, "#4A7FA6", "#7FA65C", "#C0553B", COLOR_TEXTO_SUAVE, "#E8C468"]
     fig.update_traces(marker_color=paleta[0]) if len(fig.data) == 1 and hasattr(fig.data[0], "marker") else None
     for i, trace in enumerate(fig.data):
         if hasattr(trace, "marker") and trace.marker.color is None:
