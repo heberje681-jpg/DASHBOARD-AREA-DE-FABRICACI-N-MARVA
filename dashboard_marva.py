@@ -256,6 +256,27 @@ def get_workorders(orden_ids):
 
 
 @st.cache_data(ttl=60, show_spinner=False)
+def get_ordenes_completadas_periodo(fecha_inicio, fecha_fin):
+    """Órdenes de fabricación cerradas (state=done) dentro de un rango de fechas."""
+    uid, models = conectar_odoo()
+    campo_fin = primer_campo_valido("mrp.production", ["date_finished", "date_planned_finished"])
+    ini_str = fecha_inicio.strftime("%Y-%m-%d 00:00:00")
+    fin_str = fecha_fin.strftime("%Y-%m-%d 23:59:59")
+    campos = ["name", "product_id", "product_qty", "qty_producing", "state", "bom_id", "origin", "user_id"]
+    if campo_fin:
+        campos.append(campo_fin)
+        dominio = [("state", "=", "done"), (campo_fin, ">=", ini_str), (campo_fin, "<=", fin_str)]
+    else:
+        dominio = [("state", "=", "done"), ("write_date", ">=", ini_str), ("write_date", "<=", fin_str)]
+    data = buscar_leer(models, uid, "mrp.production", dominio, campos)
+    df = pd.DataFrame(data)
+    if df.empty:
+        return df
+    df["date_finished"] = df[campo_fin] if campo_fin and campo_fin in df.columns else pd.to_datetime(df.get("write_date"))
+    return df
+
+
+@st.cache_data(ttl=60, show_spinner=False)
 def get_centros_trabajo():
     uid, models = conectar_odoo()
     campos = ["name", "costs_hour", "working_state"]
@@ -487,9 +508,9 @@ k9.metric("Costo total por pieza", f"${costo_por_pieza:,.2f}" if piezas_producid
 
 st.divider()
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "📋 Órdenes en piso", "⚙️ Centros de trabajo", "⏱️ Horas y avance",
-    "💰 Costos", "✅ Calidad", "📦 Terminadas hoy",
+    "💰 Costos", "✅ Calidad", "📦 Terminadas hoy", "📊 Acumulado por periodo",
 ])
 
 # ---------- TAB 1: Órdenes en piso ----------
@@ -639,6 +660,79 @@ with tab6:
             ),
             use_container_width=True, hide_index=True,
         )
+
+# ---------- TAB 7: Acumulado por periodo ----------
+with tab7:
+    st.subheader("Resumen acumulado")
+    st.caption("Suma órdenes ya **cerradas** (Hecho) dentro del rango de fechas que elijas — para reportería, no para piso en vivo.")
+
+    hoy = datetime.now().date()
+    inicio_semana = hoy - timedelta(days=hoy.weekday())
+    inicio_mes = hoy.replace(day=1)
+
+    col_r1, col_r2, col_r3, col_r4 = st.columns(4)
+    if "rango_acumulado" not in st.session_state:
+        st.session_state.rango_acumulado = (inicio_semana, hoy)
+    if col_r1.button("Semana actual", use_container_width=True):
+        st.session_state.rango_acumulado = (inicio_semana, hoy)
+    if col_r2.button("Últimos 7 días", use_container_width=True):
+        st.session_state.rango_acumulado = (hoy - timedelta(days=7), hoy)
+    if col_r3.button("Mes actual", use_container_width=True):
+        st.session_state.rango_acumulado = (inicio_mes, hoy)
+    if col_r4.button("Últimos 30 días", use_container_width=True):
+        st.session_state.rango_acumulado = (hoy - timedelta(days=30), hoy)
+
+    rango = st.date_input(
+        "O elige un rango personalizado",
+        value=st.session_state.rango_acumulado,
+        max_value=hoy,
+    )
+    if isinstance(rango, tuple) and len(rango) == 2:
+        fecha_inicio, fecha_fin = rango
+    else:
+        fecha_inicio, fecha_fin = st.session_state.rango_acumulado
+
+    df_periodo = intentar(get_ordenes_completadas_periodo, fecha_inicio, fecha_fin, etiqueta="el acumulado del periodo")
+
+    if df_periodo.empty:
+        st.info(f"No hay órdenes cerradas entre {fecha_inicio} y {fecha_fin}.")
+    else:
+        ids_periodo = df_periodo["id"].tolist()
+        wo_periodo = intentar(get_workorders, ids_periodo, etiqueta="las horas del periodo")
+        costo_mat_periodo = intentar(get_costo_planeado_materiales, df_periodo, etiqueta="el costo de materiales del periodo")
+        costo_mo_periodo = get_costo_mano_obra(wo_periodo, df_centros)
+
+        total_mat = costo_mat_periodo["costo_planeado"].sum() if not costo_mat_periodo.empty else 0
+        total_mo = costo_mo_periodo["costo_mano_obra"].sum() if not costo_mo_periodo.empty else 0
+        total_costo = total_mat + total_mo
+        total_piezas = df_periodo["qty_producing"].sum()
+        costo_pieza_prom = (total_costo / total_piezas) if total_piezas else 0
+
+        p1, p2, p3, p4, p5 = st.columns(5)
+        p1.metric("Órdenes cerradas", len(df_periodo))
+        p2.metric("Piezas producidas", f"{total_piezas:,.0f}")
+        p3.metric("Costo materiales (BOM)", f"${total_mat:,.0f}")
+        p4.metric("Costo mano de obra", f"${total_mo:,.0f}")
+        p5.metric("Costo por pieza (prom.)", f"${costo_pieza_prom:,.2f}" if total_piezas else "N/A")
+
+        st.markdown(f"**Costo total del periodo: ${total_costo:,.0f}**")
+
+        tabla_periodo = df_periodo.copy()
+        tabla_periodo["Producto"] = tabla_periodo["product_id"].apply(nombre_relacion)
+        tabla_periodo["Fecha Fin"] = pd.to_datetime(tabla_periodo["date_finished"], errors="coerce")
+        st.dataframe(
+            tabla_periodo[["name", "Producto", "product_qty", "qty_producing", "Fecha Fin"]].rename(
+                columns={"name": "Orden", "product_qty": "Planeado", "qty_producing": "Producido"}
+            ).sort_values("Fecha Fin"),
+            use_container_width=True, hide_index=True,
+        )
+
+        # Gráfica de piezas producidas por día dentro del rango
+        por_dia = tabla_periodo.copy()
+        por_dia["Día"] = por_dia["Fecha Fin"].dt.date
+        resumen_dia = por_dia.groupby("Día").agg(piezas=("qty_producing", "sum"), ordenes=("name", "count")).reset_index()
+        fig_dia = px.bar(resumen_dia, x="Día", y="piezas", title="Piezas producidas por día")
+        st.plotly_chart(estilizar_grafica(fig_dia), use_container_width=True)
 
 st.divider()
 st.caption(f"Última actualización: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
