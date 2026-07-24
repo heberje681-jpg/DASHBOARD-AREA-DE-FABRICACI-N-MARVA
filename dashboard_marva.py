@@ -26,6 +26,7 @@ from datetime import datetime, timedelta
 
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
 # ============================================================
@@ -297,6 +298,114 @@ def get_alertas_calidad():
         return pd.DataFrame()  # módulo de calidad no instalado o sin permisos
 
 
+@st.cache_data(ttl=120, show_spinner=False)
+def get_fallas_calidad(dias=90):
+    """Checklists de calidad (quality.check) que fallaron y bloquearon una operación."""
+    uid, models = conectar_odoo()
+    campo_estado = primer_campo_valido("quality.check", ["quality_state", "state"])
+    campo_fecha = primer_campo_valido("quality.check", ["control_date", "date", "create_date"])
+    if not campo_estado:
+        return pd.DataFrame()
+    campos = ["point_id", "production_id", "workorder_id", campo_estado]
+    dominio = [(campo_estado, "=", "fail")]
+    if campo_fecha:
+        desde = (datetime.now() - timedelta(days=dias)).strftime("%Y-%m-%d 00:00:00")
+        campos.append(campo_fecha)
+        dominio.append((campo_fecha, ">=", desde))
+    disponibles = campos_disponibles("quality.check")
+    campos = [c for c in campos if c in disponibles]
+    data = buscar_leer(models, uid, "quality.check", dominio, campos)
+    return pd.DataFrame(data)
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def get_produccion_semanal(semanas=12):
+    """Piezas producidas por semana, de órdenes ya cerradas — base para futura planeación por demanda."""
+    uid, models = conectar_odoo()
+    campo_fin = primer_campo_valido("mrp.production", ["date_finished", "date_planned_finished"])
+    desde = (datetime.now() - timedelta(weeks=semanas)).strftime("%Y-%m-%d 00:00:00")
+    campos = ["qty_producing", "state"]
+    if campo_fin:
+        campos.append(campo_fin)
+        dominio = [("state", "=", "done"), (campo_fin, ">=", desde)]
+    else:
+        campos.append("write_date")
+        dominio = [("state", "=", "done"), ("write_date", ">=", desde)]
+    data = buscar_leer(models, uid, "mrp.production", dominio, campos)
+    df = pd.DataFrame(data)
+    if df.empty:
+        return df
+    fecha_col = campo_fin if campo_fin and campo_fin in df.columns else "write_date"
+    df["fecha"] = pd.to_datetime(df[fecha_col], errors="coerce")
+    return df
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def get_eficiencia_historica(semanas=12):
+    """Eficiencia (horas esperadas / horas reales) por centro de trabajo a lo largo del tiempo.
+    Sirve como indicador indirecto de tiempo muerto, ya que no se registran motivos de paro."""
+    uid, models = conectar_odoo()
+    campo_fin = primer_campo_valido("mrp.workorder", ["date_finished", "date_planned_finished"])
+    campos = ["workcenter_id", "duration_expected", "duration", "state"]
+    dominio = [("state", "=", "done")]
+    if campo_fin:
+        desde = (datetime.now() - timedelta(weeks=semanas)).strftime("%Y-%m-%d 00:00:00")
+        campos.append(campo_fin)
+        dominio.append((campo_fin, ">=", desde))
+    data = buscar_leer(models, uid, "mrp.workorder", dominio, campos)
+    df = pd.DataFrame(data)
+    if df.empty:
+        return df
+    df["fecha"] = pd.to_datetime(df[campo_fin], errors="coerce") if campo_fin and campo_fin in df.columns else pd.NaT
+    return df
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def get_cumplimiento_entregas(dias=90):
+    """Compara fecha planeada de fin vs. fecha real de fin en órdenes ya cerradas."""
+    uid, models = conectar_odoo()
+    campo_real = primer_campo_valido("mrp.production", ["date_finished", "date_planned_finished"])
+    campo_plan = primer_campo_valido("mrp.production", ["date_planned_finished", "date_deadline"])
+    if not campo_real or not campo_plan or campo_real == campo_plan:
+        return pd.DataFrame()  # esta instalación de Odoo no distingue fecha planeada de fecha real
+    desde = (datetime.now() - timedelta(days=dias)).strftime("%Y-%m-%d 00:00:00")
+    campos = ["name", "product_id", campo_real, campo_plan]
+    dominio = [("state", "=", "done"), (campo_real, ">=", desde)]
+    data = buscar_leer(models, uid, "mrp.production", dominio, campos)
+    df = pd.DataFrame(data)
+    if df.empty:
+        return df
+    df["fecha_real"] = pd.to_datetime(df[campo_real], errors="coerce")
+    df["fecha_planeada"] = pd.to_datetime(df[campo_plan], errors="coerce")
+    df["a_tiempo"] = df["fecha_real"] <= df["fecha_planeada"]
+    df["dias_retraso"] = (df["fecha_real"] - df["fecha_planeada"]).dt.total_seconds() / 86400
+    return df
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def get_tiempo_ciclo(dias=180):
+    """Días entre que se crea una orden y se cierra, por producto — útil para cotizar tiempos futuros."""
+    uid, models = conectar_odoo()
+    campo_fin = primer_campo_valido("mrp.production", ["date_finished", "date_planned_finished"])
+    desde = (datetime.now() - timedelta(days=dias)).strftime("%Y-%m-%d 00:00:00")
+    campos = ["name", "product_id", "create_date"]
+    if campo_fin:
+        campos.append(campo_fin)
+        dominio = [("state", "=", "done"), (campo_fin, ">=", desde)]
+    else:
+        campos.append("write_date")
+        dominio = [("state", "=", "done"), ("write_date", ">=", desde)]
+    data = buscar_leer(models, uid, "mrp.production", dominio, campos)
+    df = pd.DataFrame(data)
+    if df.empty:
+        return df
+    fecha_col = campo_fin if campo_fin and campo_fin in df.columns else "write_date"
+    df["fecha_inicio"] = pd.to_datetime(df["create_date"], errors="coerce")
+    df["fecha_fin"] = pd.to_datetime(df[fecha_col], errors="coerce")
+    df["dias_ciclo"] = (df["fecha_fin"] - df["fecha_inicio"]).dt.total_seconds() / 86400
+    return df
+
+
 @st.cache_data(ttl=30, show_spinner=False)
 def get_consumo_materiales(orden_ids):
     """
@@ -508,9 +617,10 @@ k9.metric("Costo total por pieza", f"${costo_por_pieza:,.2f}" if piezas_producid
 
 st.divider()
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
     "📋 Órdenes en piso", "⚙️ Centros de trabajo", "⏱️ Horas y avance",
     "💰 Costos", "✅ Calidad", "📦 Terminadas hoy", "📊 Acumulado por periodo",
+    "📈 Análisis",
 ])
 
 # ---------- TAB 1: Órdenes en piso ----------
@@ -549,6 +659,19 @@ with tab2:
         fig = px.bar(carga, x="Centro", y="Cantidad", color="state", barmode="stack",
                      title="Órdenes de trabajo por centro y estado")
         st.plotly_chart(estilizar_grafica(fig), use_container_width=True)
+
+        st.markdown("**Carga futura: horas comprometidas por centro de trabajo**")
+        st.caption("Horas planeadas de las operaciones que aún no terminan (pendientes + en progreso) — para anticipar cuellos de botella.")
+        wo_pendiente = wo[wo["state"] != "done"].copy()
+        if wo_pendiente.empty:
+            st.info("No hay horas pendientes por asignar en este momento.")
+        else:
+            carga_horas = wo_pendiente.groupby(["Centro", "state"]).agg(
+                horas=("duration_expected", lambda s: s.sum() / 60.0)
+            ).reset_index()
+            fig_carga = px.bar(carga_horas, x="Centro", y="horas", color="state", barmode="stack",
+                                title="Horas comprometidas por centro de trabajo")
+            st.plotly_chart(estilizar_grafica(fig_carga), use_container_width=True)
 
         if not df_centros.empty:
             st.dataframe(
@@ -733,6 +856,121 @@ with tab7:
         resumen_dia = por_dia.groupby("Día").agg(piezas=("qty_producing", "sum"), ordenes=("name", "count")).reset_index()
         fig_dia = px.bar(resumen_dia, x="Día", y="piezas", title="Piezas producidas por día")
         st.plotly_chart(estilizar_grafica(fig_dia), use_container_width=True)
+
+# ---------- TAB 8: Análisis ----------
+with tab8:
+    st.subheader("Cumplimiento de fecha de entrega")
+    st.caption("% de órdenes cerradas en la fecha planeada o antes, últimos 90 días.")
+    df_cumplimiento = intentar(get_cumplimiento_entregas, etiqueta="el cumplimiento de entregas")
+    if df_cumplimiento.empty:
+        st.info(
+            "Aún no hay suficientes órdenes cerradas con fecha planeada de entrega para calcular esto "
+            "(o esta versión de Odoo no distingue fecha planeada de fecha real)."
+        )
+    else:
+        pct_a_tiempo = df_cumplimiento["a_tiempo"].mean() * 100
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Entregado a tiempo", f"{pct_a_tiempo:.0f}%")
+        c2.metric("Órdenes analizadas", len(df_cumplimiento))
+        promedio_retraso = df_cumplimiento.loc[~df_cumplimiento["a_tiempo"], "dias_retraso"].mean()
+        c3.metric("Retraso promedio (cuando se atrasa)", f"{promedio_retraso:.1f} días" if pd.notna(promedio_retraso) else "N/A")
+
+        df_cumplimiento["Semana"] = df_cumplimiento["fecha_real"].dt.to_period("W").apply(lambda p: p.start_time.date())
+        semanal_cumpl = df_cumplimiento.groupby("Semana").agg(pct_a_tiempo=("a_tiempo", "mean")).reset_index()
+        semanal_cumpl["pct_a_tiempo"] = (semanal_cumpl["pct_a_tiempo"] * 100).round(1)
+        fig_cumpl = px.line(semanal_cumpl, x="Semana", y="pct_a_tiempo", markers=True,
+                             title="% de entregas a tiempo por semana")
+        fig_cumpl.update_yaxes(range=[0, 105])
+        st.plotly_chart(estilizar_grafica(fig_cumpl), use_container_width=True)
+
+        atrasadas_hist = df_cumplimiento[~df_cumplimiento["a_tiempo"]].sort_values("dias_retraso", ascending=False)
+        if not atrasadas_hist.empty:
+            st.markdown("**Órdenes con mayor retraso**")
+            atrasadas_hist["Producto"] = atrasadas_hist["product_id"].apply(nombre_relacion)
+            st.dataframe(
+                atrasadas_hist[["name", "Producto", "dias_retraso"]].rename(
+                    columns={"name": "Orden", "dias_retraso": "Días de Retraso"}
+                ).round(1).head(10),
+                use_container_width=True, hide_index=True,
+            )
+
+    st.divider()
+    st.subheader("Tiempo de ciclo por producto")
+    st.caption("Días desde que se crea la orden hasta que se cierra — útil para cotizar tiempos de entrega en proyectos futuros.")
+    df_ciclo = intentar(get_tiempo_ciclo, etiqueta="el tiempo de ciclo")
+    if df_ciclo.empty:
+        st.info("Aún no hay suficiente historial de órdenes cerradas para calcular tiempos de ciclo.")
+    else:
+        df_ciclo["Producto"] = df_ciclo["product_id"].apply(nombre_relacion)
+        ciclo_producto = df_ciclo.groupby("Producto").agg(
+            dias_promedio=("dias_ciclo", "mean"), ordenes=("name", "count")
+        ).reset_index().sort_values("dias_promedio", ascending=False).head(15)
+        fig_ciclo = px.bar(ciclo_producto, x="Producto", y="dias_promedio",
+                            title="Días de ciclo promedio por producto (top 15)")
+        st.plotly_chart(estilizar_grafica(fig_ciclo), use_container_width=True)
+        st.metric("Tiempo de ciclo promedio general", f"{df_ciclo['dias_ciclo'].mean():.1f} días")
+
+    st.divider()
+    st.subheader("Pareto de fallas de calidad")
+    st.caption(
+        "Puntos de control de tus checklists que más veces han bloqueado una operación "
+        "en los últimos 90 días."
+    )
+    df_fallas = intentar(get_fallas_calidad, etiqueta="las fallas de calidad")
+    if df_fallas.empty:
+        st.info("Aún no hay fallas de calidad registradas (o los checklists son muy nuevos).")
+    else:
+        df_fallas["Punto de Control"] = df_fallas["point_id"].apply(nombre_relacion) if "point_id" in df_fallas.columns else "Sin especificar"
+        conteo = df_fallas.groupby("Punto de Control").size().reset_index(name="Fallas").sort_values("Fallas", ascending=False)
+        conteo["% Acumulado"] = (conteo["Fallas"].cumsum() / conteo["Fallas"].sum() * 100).round(1)
+
+        fig_pareto = go.Figure()
+        fig_pareto.add_bar(x=conteo["Punto de Control"], y=conteo["Fallas"], name="Fallas", marker_color=COLOR_PRIMARIO)
+        fig_pareto.add_scatter(x=conteo["Punto de Control"], y=conteo["% Acumulado"], name="% Acumulado",
+                                yaxis="y2", mode="lines+markers", line=dict(color=COLOR_TEXTO))
+        fig_pareto.update_layout(
+            title="Pareto de fallas de calidad por punto de control",
+            yaxis=dict(title="Fallas"),
+            yaxis2=dict(title="% Acumulado", overlaying="y", side="right", range=[0, 110]),
+        )
+        st.plotly_chart(estilizar_grafica(fig_pareto), use_container_width=True)
+        st.dataframe(conteo, use_container_width=True, hide_index=True)
+        st.caption("Regla 80/20: los puntos que juntos suman ~80% acumulado son donde conviene enfocar la mejora primero.")
+
+    st.divider()
+    st.subheader("Tendencia de producción (últimas 12 semanas)")
+    df_prod_semanal = intentar(get_produccion_semanal, etiqueta="la tendencia de producción")
+    if df_prod_semanal.empty:
+        st.info(
+            "Todavía no hay suficiente historial de órdenes cerradas para mostrar una tendencia. "
+            "Esta gráfica se va llenando sola conforme Marva cierre más órdenes — en unos meses "
+            "sirve como base real para planear producción por demanda estacional."
+        )
+    else:
+        df_prod_semanal["Semana"] = df_prod_semanal["fecha"].dt.to_period("W").apply(lambda p: p.start_time.date())
+        semanal = df_prod_semanal.groupby("Semana").agg(piezas=("qty_producing", "sum")).reset_index()
+        fig_tend = px.line(semanal, x="Semana", y="piezas", markers=True, title="Piezas producidas por semana")
+        st.plotly_chart(estilizar_grafica(fig_tend), use_container_width=True)
+
+    st.divider()
+    st.subheader("Eficiencia por centro de trabajo en el tiempo")
+    st.caption(
+        "Como no se registran motivos de tiempo muerto, esta gráfica sirve como indicador "
+        "indirecto: si la eficiencia de un centro cae de golpe, probablemente hubo paros no documentados."
+    )
+    df_efi = intentar(get_eficiencia_historica, etiqueta="la eficiencia histórica")
+    if df_efi.empty:
+        st.info("Aún no hay operaciones cerradas para calcular eficiencia histórica.")
+    else:
+        df_efi["Centro"] = df_efi["workcenter_id"].apply(nombre_relacion)
+        df_efi["Semana"] = df_efi["fecha"].dt.to_period("W").apply(lambda p: p.start_time.date()) if df_efi["fecha"].notna().any() else "Sin fecha"
+        efi_semanal = df_efi.groupby(["Semana", "Centro"]).agg(
+            esperado=("duration_expected", "sum"), real=("duration", "sum")
+        ).reset_index()
+        efi_semanal["Eficiencia %"] = (efi_semanal["esperado"] / efi_semanal["real"].replace(0, pd.NA) * 100).round(1)
+        fig_efi = px.line(efi_semanal, x="Semana", y="Eficiencia %", color="Centro", markers=True,
+                           title="Eficiencia semanal por centro de trabajo")
+        st.plotly_chart(estilizar_grafica(fig_efi), use_container_width=True)
 
 st.divider()
 st.caption(f"Última actualización: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
