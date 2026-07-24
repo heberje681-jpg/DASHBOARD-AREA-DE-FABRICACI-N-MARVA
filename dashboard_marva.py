@@ -448,13 +448,15 @@ def get_consumo_materiales(orden_ids):
 
 @st.cache_data(ttl=60, show_spinner=False)
 def get_costo_planeado_materiales(df_ordenes):
-    """Costo de materiales según receta (BOM), escalado a la cantidad a producir de cada orden."""
+    """Costo de materiales según receta (BOM), escalado a la cantidad a producir de cada orden.
+    Regresa (df_costos_por_orden, df_diagnostico_por_componente)."""
     if df_ordenes.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame()
     uid, models = conectar_odoo()
-    bom_ids = df_ordenes["bom_id"].dropna().apply(lambda x: x[0] if isinstance(x, (list, tuple)) else x).unique().tolist()
+    bom_ids = [x[0] if isinstance(x, (list, tuple)) else x for x in df_ordenes["bom_id"] if x]
+    bom_ids = list(dict.fromkeys(bom_ids))  # únicos, conserva orden
     if not bom_ids:
-        return pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame()
 
     boms = buscar_leer(models, uid, "mrp.bom", [("id", "in", bom_ids)], ["id", "product_qty"])
     df_boms = pd.DataFrame(boms).rename(columns={"id": "bom_id", "product_qty": "bom_cantidad_base"})
@@ -462,9 +464,10 @@ def get_costo_planeado_materiales(df_ordenes):
     lineas = buscar_leer(models, uid, "mrp.bom.line", [("bom_id", "in", bom_ids)], ["bom_id", "product_id", "product_qty"])
     df_lineas = pd.DataFrame(lineas)
     if df_lineas.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame()
     df_lineas["bom_id"] = df_lineas["bom_id"].apply(lambda x: x[0] if isinstance(x, (list, tuple)) else x)
     df_lineas["producto_id"] = df_lineas["product_id"].apply(lambda x: x[0] if isinstance(x, (list, tuple)) else x)
+    df_lineas["Producto"] = df_lineas["product_id"].apply(nombre_relacion)
 
     product_ids = df_lineas["producto_id"].unique().tolist()
     precios = buscar_leer(models, uid, "product.product", [("id", "in", product_ids)], ["standard_price"])
@@ -473,6 +476,9 @@ def get_costo_planeado_materiales(df_ordenes):
     df_lineas = df_lineas.merge(df_precios, on="producto_id", how="left")
     df_lineas = df_lineas.merge(df_boms, on="bom_id", how="left")
     df_lineas["costo_linea"] = df_lineas["product_qty"] * df_lineas["costo_unitario"].fillna(0)
+    diagnostico = df_lineas[["Producto", "product_qty", "costo_unitario", "costo_linea"]].rename(
+        columns={"product_qty": "Cantidad en Receta", "costo_unitario": "Costo Unitario en Odoo", "costo_linea": "Costo de la Línea"}
+    ).drop_duplicates(subset=["Producto"]).sort_values("Costo Unitario en Odoo")
 
     costo_bom = df_lineas.groupby("bom_id").agg(
         costo_por_lote=("costo_linea", "sum"),
@@ -484,7 +490,7 @@ def get_costo_planeado_materiales(df_ordenes):
     ordenes["bom_id"] = ordenes["bom_id"].apply(lambda x: x[0] if isinstance(x, (list, tuple)) else x)
     ordenes = ordenes.merge(costo_bom, on="bom_id", how="left")
     ordenes["costo_planeado"] = ordenes["costo_unitario_bom"].fillna(0) * ordenes["product_qty"]
-    return ordenes[["id", "name", "costo_planeado"]]
+    return ordenes[["id", "name", "costo_planeado"]], diagnostico
 
 
 def get_costo_mano_obra(df_workorders, df_centros):
@@ -592,14 +598,17 @@ df_centros = intentar(get_centros_trabajo, etiqueta="los centros de trabajo")
 df_calidad = intentar(get_alertas_calidad, etiqueta="las alertas de calidad")
 
 # ---------- Costos ----------
-df_costo_planeado = intentar(get_costo_planeado_materiales, df_ordenes, etiqueta="el costo planeado (BOM)")
+try:
+    df_costo_planeado, df_diagnostico_bom = get_costo_planeado_materiales(df_ordenes)
+except Exception as e:
+    st.warning(f"No se pudo cargar el costo planeado (BOM): {e}")
+    df_costo_planeado, df_diagnostico_bom = pd.DataFrame(), pd.DataFrame()
 df_costo_mo = get_costo_mano_obra(df_workorders, df_centros)
 
 costo_material_planeado_total = df_costo_planeado["costo_planeado"].sum() if not df_costo_planeado.empty else 0
 costo_mano_obra_total = df_costo_mo["costo_mano_obra"].sum() if not df_costo_mo.empty else 0
 costo_total_produccion = costo_material_planeado_total + costo_mano_obra_total
-piezas_producidas_total = df_ordenes["qty_producing"].sum() if not df_ordenes.empty else 0
-costo_por_pieza = (costo_total_produccion / piezas_producidas_total) if piezas_producidas_total else 0
+componentes_sin_costo = int((df_diagnostico_bom["Costo Unitario en Odoo"].fillna(0) == 0).sum()) if not df_diagnostico_bom.empty else 0
 
 # ---------- KPIs ----------
 k1, k2, k3, k4, k5 = st.columns(5)
@@ -613,7 +622,7 @@ k6, k7, k8, k9 = st.columns(4)
 k6.metric("Costo materiales (BOM)", f"${costo_material_planeado_total:,.0f}")
 k7.metric("Costo mano de obra (real)", f"${costo_mano_obra_total:,.0f}")
 k8.metric("Costo total de producción", f"${costo_total_produccion:,.0f}")
-k9.metric("Costo total por pieza", f"${costo_por_pieza:,.2f}" if piezas_producidas_total else "N/A")
+k9.metric("Componentes sin costo en Odoo", f"{componentes_sin_costo} de {len(df_diagnostico_bom)}" if not df_diagnostico_bom.empty else "0 de 0")
 
 st.divider()
 
@@ -712,6 +721,14 @@ with tab4:
         "inventario real se controla en otro sistema. Mano de obra = horas reales del "
         "workorder × costo-hora del centro de trabajo (máquina + operador) configurado en Odoo."
     )
+
+    with st.expander("🔍 Diagnóstico: costo unitario que el dashboard está leyendo de cada componente"):
+        if df_diagnostico_bom.empty:
+            st.write("No se encontró ningún componente de receta (BOM) en las órdenes activas.")
+        else:
+            st.caption("Si un componente aparece en $0 aquí pero sí tiene costo en su ficha de producto en Odoo, dime el nombre exacto del producto y seguimos investigando ese caso puntual.")
+            st.dataframe(df_diagnostico_bom, use_container_width=True, hide_index=True)
+
     if df_costo_planeado.empty and df_costo_mo.empty:
         st.info("Aún no hay órdenes con receta (BOM) o tiempos registrados.")
     else:
@@ -822,7 +839,11 @@ with tab7:
     else:
         ids_periodo = df_periodo["id"].tolist()
         wo_periodo = intentar(get_workorders, ids_periodo, etiqueta="las horas del periodo")
-        costo_mat_periodo = intentar(get_costo_planeado_materiales, df_periodo, etiqueta="el costo de materiales del periodo")
+        try:
+            costo_mat_periodo, _ = get_costo_planeado_materiales(df_periodo)
+        except Exception as e:
+            st.warning(f"No se pudo cargar el costo de materiales del periodo: {e}")
+            costo_mat_periodo = pd.DataFrame()
         costo_mo_periodo = get_costo_mano_obra(wo_periodo, df_centros)
 
         total_mat = costo_mat_periodo["costo_planeado"].sum() if not costo_mat_periodo.empty else 0
