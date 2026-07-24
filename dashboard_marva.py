@@ -658,7 +658,7 @@ with tab2:
         carga = wo.groupby(["Centro", "state"]).size().reset_index(name="Cantidad")
         fig = px.bar(carga, x="Centro", y="Cantidad", color="state", barmode="stack",
                      title="Órdenes de trabajo por centro y estado")
-        st.plotly_chart(estilizar_grafica(fig), use_container_width=True)
+        st.plotly_chart(estilizar_grafica(fig), use_container_width=True, key="grafica_carga_centro")
 
         st.markdown("**Carga futura: horas comprometidas por centro de trabajo**")
         st.caption("Horas planeadas de las operaciones que aún no terminan (pendientes + en progreso) — para anticipar cuellos de botella.")
@@ -671,7 +671,7 @@ with tab2:
             ).reset_index()
             fig_carga = px.bar(carga_horas, x="Centro", y="horas", color="state", barmode="stack",
                                 title="Horas comprometidas por centro de trabajo")
-            st.plotly_chart(estilizar_grafica(fig_carga), use_container_width=True)
+            st.plotly_chart(estilizar_grafica(fig_carga), use_container_width=True, key="grafica_horas_comprometidas")
 
         if not df_centros.empty:
             st.dataframe(
@@ -748,7 +748,7 @@ with tab4:
                 horas_reales=("duration", lambda s: s.sum() / 60.0), costo=("costo", "sum")
             ).reset_index()
             fig_centro = px.bar(por_centro, x="Centro", y="costo", title="Costo de mano de obra por centro de trabajo")
-            st.plotly_chart(estilizar_grafica(fig_centro), use_container_width=True)
+            st.plotly_chart(estilizar_grafica(fig_centro), use_container_width=True, key="grafica_costo_mano_obra_centro")
         else:
             st.info("Aún no hay horas registradas en órdenes de trabajo.")
 
@@ -855,7 +855,7 @@ with tab7:
         por_dia["Día"] = por_dia["Fecha Fin"].dt.date
         resumen_dia = por_dia.groupby("Día").agg(piezas=("qty_producing", "sum"), ordenes=("name", "count")).reset_index()
         fig_dia = px.bar(resumen_dia, x="Día", y="piezas", title="Piezas producidas por día")
-        st.plotly_chart(estilizar_grafica(fig_dia), use_container_width=True)
+        st.plotly_chart(estilizar_grafica(fig_dia), use_container_width=True, key="grafica_piezas_por_dia_periodo")
 
 # ---------- TAB 8: Análisis ----------
 with tab8:
@@ -881,7 +881,7 @@ with tab8:
         fig_cumpl = px.line(semanal_cumpl, x="Semana", y="pct_a_tiempo", markers=True,
                              title="% de entregas a tiempo por semana")
         fig_cumpl.update_yaxes(range=[0, 105])
-        st.plotly_chart(estilizar_grafica(fig_cumpl), use_container_width=True)
+        st.plotly_chart(estilizar_grafica(fig_cumpl), use_container_width=True, key="grafica_cumplimiento_entregas")
 
         atrasadas_hist = df_cumplimiento[~df_cumplimiento["a_tiempo"]].sort_values("dias_retraso", ascending=False)
         if not atrasadas_hist.empty:
@@ -907,7 +907,7 @@ with tab8:
         ).reset_index().sort_values("dias_promedio", ascending=False).head(15)
         fig_ciclo = px.bar(ciclo_producto, x="Producto", y="dias_promedio",
                             title="Días de ciclo promedio por producto (top 15)")
-        st.plotly_chart(estilizar_grafica(fig_ciclo), use_container_width=True)
+        st.plotly_chart(estilizar_grafica(fig_ciclo), use_container_width=True, key="grafica_tiempo_ciclo")
         st.metric("Tiempo de ciclo promedio general", f"{df_ciclo['dias_ciclo'].mean():.1f} días")
 
     st.divider()
@@ -933,7 +933,7 @@ with tab8:
             yaxis=dict(title="Fallas"),
             yaxis2=dict(title="% Acumulado", overlaying="y", side="right", range=[0, 110]),
         )
-        st.plotly_chart(estilizar_grafica(fig_pareto), use_container_width=True)
+        st.plotly_chart(estilizar_grafica(fig_pareto), use_container_width=True, key="grafica_pareto_calidad")
         st.dataframe(conteo, use_container_width=True, hide_index=True)
         st.caption("Regla 80/20: los puntos que juntos suman ~80% acumulado son donde conviene enfocar la mejora primero.")
 
@@ -950,7 +950,7 @@ with tab8:
         df_prod_semanal["Semana"] = df_prod_semanal["fecha"].dt.to_period("W").apply(lambda p: p.start_time.date())
         semanal = df_prod_semanal.groupby("Semana").agg(piezas=("qty_producing", "sum")).reset_index()
         fig_tend = px.line(semanal, x="Semana", y="piezas", markers=True, title="Piezas producidas por semana")
-        st.plotly_chart(estilizar_grafica(fig_tend), use_container_width=True)
+        st.plotly_chart(estilizar_grafica(fig_tend), use_container_width=True, key="grafica_tendencia_produccion")
 
     st.divider()
     st.subheader("Eficiencia por centro de trabajo en el tiempo")
@@ -970,7 +970,7 @@ with tab8:
         efi_semanal["Eficiencia %"] = (efi_semanal["esperado"] / efi_semanal["real"].replace(0, float("nan")) * 100).round(1)
         fig_efi = px.line(efi_semanal, x="Semana", y="Eficiencia %", color="Centro", markers=True,
                            title="Eficiencia semanal por centro de trabajo")
-        st.plotly_chart(estilizar_grafica(fig_efi), use_container_width=True)
+        st.plotly_chart(estilizar_grafica(fig_efi), use_container_width=True, key="grafica_eficiencia_historica")
 
 st.divider()
 st.caption(f"Última actualización: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
