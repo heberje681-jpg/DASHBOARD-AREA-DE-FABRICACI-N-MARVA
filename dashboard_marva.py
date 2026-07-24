@@ -692,7 +692,7 @@ with tab3:
             "name": "Operación", "duration_expected": "Min. Esperados", "duration": "Min. Reales",
         })
         comparativa["Eficiencia %"] = (
-            comparativa["Min. Esperados"] / comparativa["Min. Reales"].replace(0, pd.NA) * 100
+            comparativa["Min. Esperados"] / comparativa["Min. Reales"].replace(0, float("nan")) * 100
         ).round(1)
         st.dataframe(comparativa, use_container_width=True, hide_index=True)
 
@@ -967,7 +967,7 @@ with tab8:
         efi_semanal = df_efi.groupby(["Semana", "Centro"]).agg(
             esperado=("duration_expected", "sum"), real=("duration", "sum")
         ).reset_index()
-        efi_semanal["Eficiencia %"] = (efi_semanal["esperado"] / efi_semanal["real"].replace(0, pd.NA) * 100).round(1)
+        efi_semanal["Eficiencia %"] = (efi_semanal["esperado"] / efi_semanal["real"].replace(0, float("nan")) * 100).round(1)
         fig_efi = px.line(efi_semanal, x="Semana", y="Eficiencia %", color="Centro", markers=True,
                            title="Eficiencia semanal por centro de trabajo")
         st.plotly_chart(estilizar_grafica(fig_efi), use_container_width=True)
