@@ -343,6 +343,31 @@ def guardar_proyectos(proyectos):
         )
 
 
+def mostrar_detalle_mano_obra(resultado_costos, clave):
+    """Desplegable con lo que se leyó de cada empleado: minutos, costo por hora y costo."""
+    with st.expander("👷 Mano de obra por empleado (minutos ÷ 60 × costo por hora)"):
+        if resultado_costos is None or resultado_costos.empty:
+            st.write("Sin datos de operaciones todavía.")
+            return
+        detalle = resultado_costos.attrs.get("empleados")
+        nota = resultado_costos.attrs.get("nota", "")
+        sin_tiempos = resultado_costos.attrs.get("operaciones_sin_tiempos", 0)
+        if detalle is not None and not detalle.empty:
+            st.dataframe(
+                detalle, use_container_width=True, hide_index=True,
+                column_config={
+                    "Minutos": st.column_config.NumberColumn("Minutos", format="%.1f"),
+                    "Costo por hora": st.column_config.NumberColumn("Costo por hora", format="$%.2f"),
+                    "Costo": st.column_config.NumberColumn("Costo", format="$%.2f"),
+                },
+                key=clave,
+            )
+        if nota:
+            st.info(nota)
+        if sin_tiempos:
+            st.caption(f"{sin_tiempos} operación(es) sin tiempo por empleado: se calcularon con el costo 'por empleado' del centro de trabajo.")
+
+
 def _a_fecha(serie):
     """Odoo manda False en las fechas vacías; esto las convierte a NaT sin truenes."""
     return pd.to_datetime(serie.apply(lambda x: x if isinstance(x, str) else None), errors="coerce")
@@ -573,13 +598,63 @@ def get_costo_planeado_materiales(df_ordenes):
     return ordenes[["id", "name", "costo_planeado"]], diagnostico
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def get_tiempos_empleados(workorder_ids):
+    """Tiempo que cada empleado registró en cada operación (mrp.workcenter.productivity)
+    junto con su 'Costo por hora' de la ficha del empleado (hr.employee).
+    Regresa (df, nota). La nota explica por qué no hay datos, si es el caso."""
+    columnas = ["workorder_id", "empleado", "emp_id", "minutos", "costo_hora"]
+    if not workorder_ids:
+        return pd.DataFrame(columns=columnas), "No hay operaciones."
+    uid, models = conectar_odoo()
+    try:
+        disponibles = campos_disponibles("mrp.workcenter.productivity")
+        if "employee_id" not in disponibles:
+            return pd.DataFrame(columns=columnas), "Los registros de tiempo de Odoo no guardan el empleado (campo employee_id)."
+        campos = [c for c in ["workorder_id", "employee_id", "duration"] if c in disponibles]
+        data = buscar_leer(models, uid, "mrp.workcenter.productivity", [("workorder_id", "in", list(workorder_ids))], campos)
+    except Exception as e:
+        return pd.DataFrame(columns=columnas), f"No se pudieron leer los registros de tiempo: {str(e)[-150:]}"
+    df = pd.DataFrame(data)
+    if df.empty:
+        return pd.DataFrame(columns=columnas), "Las operaciones no tienen tiempo registrado todavía."
+
+    df["workorder_id"] = df["workorder_id"].apply(lambda x: x[0] if isinstance(x, (list, tuple)) else x)
+    df["emp_id"] = df["employee_id"].apply(lambda x: x[0] if isinstance(x, (list, tuple)) else None)
+    df["empleado"] = df["employee_id"].apply(lambda x: x[1] if isinstance(x, (list, tuple)) else "(sin empleado registrado)")
+    df["minutos"] = pd.to_numeric(df["duration"], errors="coerce").fillna(0.0)
+
+    nota = ""
+    tarifas = {}
+    emp_ids = [int(i) for i in df["emp_id"].dropna().unique()]
+    try:
+        campo_costo = primer_campo_valido("hr.employee", ["hourly_cost", "timesheet_cost"])
+        if emp_ids and campo_costo:
+            res = models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD, "hr.employee", "search_read",
+                [[("id", "in", emp_ids)]], {"fields": [campo_costo], "context": {"active_test": False}},
+            )
+            tarifas = {r["id"]: float(r.get(campo_costo) or 0.0) for r in res}
+        elif emp_ids:
+            nota = "No encontré el campo 'Costo por hora' en la ficha del empleado."
+    except Exception as e:
+        nota = f"No se pudo leer el costo por hora de los empleados: {str(e)[-150:]}"
+    df["costo_hora"] = df["emp_id"].map(tarifas).fillna(0.0)
+    return df[columnas], nota
+
+
 def get_costo_mano_obra(df_workorders, df_centros):
-    """Costo real por orden, separado en operador y máquina:
-    minutos reales / 60 × costo-hora del empleado (mano de obra) y × costo-hora de la máquina.
-    Regresa por orden: costo_mano_obra, costo_maquina, horas_trabajadas."""
+    """Costo real por orden, separado en operador y máquina.
+    - Mano de obra: minutos que cada empleado registró ÷ 60 × su 'Costo por hora' (ficha del empleado).
+      Si el empleado no tiene costo por hora, se usa el 'por empleado' del centro de trabajo.
+      Si la operación no tiene tiempos por empleado, se usa el 'por empleado' del centro × horas de la operación.
+    - Maquinaria: horas de la operación × costo por hora de la máquina (centro de trabajo).
+    Regresa por orden: costo_mano_obra, costo_maquina, horas_trabajadas.
+    En .attrs trae 'empleados' (detalle por empleado) y 'nota' (diagnóstico)."""
     if df_workorders.empty or df_centros.empty:
         return pd.DataFrame()
     wo = df_workorders.copy()
+    wo["wo_id"] = wo["id"]
     wo["centro_id"] = wo["workcenter_id"].apply(lambda x: x[0] if isinstance(x, (list, tuple)) else x)
     wo["orden_id"] = wo["production_id"].apply(lambda x: x[0] if isinstance(x, (list, tuple)) else x)
     wo["orden"] = wo["production_id"].apply(nombre_relacion)
@@ -593,14 +668,39 @@ def get_costo_mano_obra(df_workorders, df_centros):
     centros = centros[["centro_id", "costo_hora_maquina", "costo_hora_empleado"]]
     wo = wo.merge(centros, on="centro_id", how="left")
     horas = wo["duration"].fillna(0) / 60.0
-    wo["costo_mano_obra"] = horas * wo["costo_hora_empleado"].fillna(0)
     wo["costo_maquina"] = horas * wo["costo_hora_maquina"].fillna(0)
     wo["horas_trabajadas"] = horas
-    return wo.groupby(["orden_id", "orden"]).agg(
+
+    # --- Mano de obra: tiempo por empleado × costo por hora del empleado ---
+    try:
+        logs, nota = get_tiempos_empleados([int(i) for i in wo["wo_id"].tolist()])
+    except Exception as e:
+        logs, nota = pd.DataFrame(columns=["workorder_id", "empleado", "emp_id", "minutos", "costo_hora"]), str(e)[-150:]
+    tarifa_centro = wo.set_index("wo_id")["costo_hora_empleado"].fillna(0.0)
+    detalle = pd.DataFrame()
+    por_wo = pd.Series(dtype=float)
+    if not logs.empty:
+        logs = logs.copy()
+        logs["tarifa_centro"] = logs["workorder_id"].map(tarifa_centro).fillna(0.0)
+        logs["tarifa"] = logs["costo_hora"].where(logs["costo_hora"] > 0, logs["tarifa_centro"])
+        logs["costo"] = logs["minutos"] / 60.0 * logs["tarifa"]
+        por_wo = logs.groupby("workorder_id")["costo"].sum()
+        detalle = logs.groupby("empleado").agg(
+            Minutos=("minutos", "sum"), Costo_por_hora=("tarifa", "max"), Costo=("costo", "sum"),
+        ).reset_index().rename(columns={"empleado": "Empleado", "Costo_por_hora": "Costo por hora"})
+    wo["costo_mano_obra"] = wo["wo_id"].map(por_wo)
+    sin_tiempos = wo["costo_mano_obra"].isna()
+    wo.loc[sin_tiempos, "costo_mano_obra"] = horas[sin_tiempos] * wo.loc[sin_tiempos, "costo_hora_empleado"].fillna(0.0)
+
+    resultado = wo.groupby(["orden_id", "orden"]).agg(
         costo_mano_obra=("costo_mano_obra", "sum"),
         costo_maquina=("costo_maquina", "sum"),
         horas_trabajadas=("horas_trabajadas", "sum"),
     ).reset_index()
+    resultado.attrs["empleados"] = detalle
+    resultado.attrs["nota"] = nota
+    resultado.attrs["operaciones_sin_tiempos"] = int(sin_tiempos.sum())
+    return resultado
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -815,8 +915,8 @@ with tab4:
     st.subheader("Costo de producción por orden")
     st.caption(
         "Materiales = costo estimado según la receta (BOM) de cada producto, ya que el "
-        "inventario real se controla en otro sistema. Mano de obra = horas reales × costo-hora "
-        "del operador; Maquinaria = horas reales × costo-hora de la máquina (ambos del centro de trabajo en Odoo)."
+        "inventario real se controla en otro sistema. Mano de obra = tiempo que cada empleado registró × su "
+        "'Costo por hora' (ficha del empleado); Maquinaria = horas reales × costo-hora de la máquina (centro de trabajo)."
     )
 
     with st.expander("🔍 Diagnóstico: costo unitario que el dashboard está leyendo de cada componente"):
@@ -825,6 +925,8 @@ with tab4:
         else:
             st.caption("Si un componente aparece en $0 aquí pero sí tiene costo en su ficha de producto en Odoo, dime el nombre exacto del producto y seguimos investigando ese caso puntual.")
             st.dataframe(df_diagnostico_bom, use_container_width=True, hide_index=True)
+
+    mostrar_detalle_mano_obra(df_costo_mo, "tabla_mano_obra_costos")
 
     if df_costo_planeado.empty and df_costo_mo.empty:
         st.info("Aún no hay órdenes con receta (BOM) o tiempos registrados.")
@@ -1156,9 +1258,20 @@ with tab_proyectos:
                 st.plotly_chart(estilizar_grafica(fig_proy), use_container_width=True, key="grafica_proyecto_costos")
 
                 # --- Avisos de datos incompletos ---
-                col_emp = df_centros.get("employee_costs_hour") if not df_centros.empty else None
-                if col_emp is None or (col_emp.fillna(0) == 0).all():
-                    st.warning("Los centros de trabajo no traen costo por hora del operador (o está en $0); por eso la mano de obra sale en $0.")
+                mostrar_detalle_mano_obra(costo_op_sel, "tabla_mano_obra_proyecto")
+                n_sin_tiempos = costo_op_sel.attrs.get("operaciones_sin_tiempos", 0) if not costo_op_sel.empty else 0
+                if n_sin_tiempos:
+                    st.warning(
+                        f"{n_sin_tiempos} operación(es) no tienen tiempo registrado por empleado; su mano de obra se calculó "
+                        "con el costo 'por empleado' del centro de trabajo (si ahí es $0, queda en $0). Para que cuente el "
+                        "costo por hora del empleado, el operador debe iniciar y terminar la operación en Taller con su usuario."
+                    )
+                if tot_mo <= 0 and tot_horas > 0:
+                    nota_mo = costo_op_sel.attrs.get("nota", "") if not costo_op_sel.empty else ""
+                    st.warning(
+                        "La mano de obra sale en $0: ningún empleado con tiempo registrado tiene 'Costo por hora' "
+                        "(ficha del empleado → Ajustes de RR. HH.)." + (f" {nota_mo}" if nota_mo else "")
+                    )
                 sin_mat = t.loc[t["costo_planeado"] <= 0, "name"].tolist()
                 if sin_mat:
                     st.warning("Materiales en $0 en: " + ", ".join(sin_mat) + " (sin receta BOM o con componentes sin costo en Odoo).")
