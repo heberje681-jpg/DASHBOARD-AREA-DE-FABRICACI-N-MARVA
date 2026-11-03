@@ -21,6 +21,8 @@ Uso:
        streamlit run dashboard_marva.py
 """
 
+import base64
+import json
 import xmlrpc.client
 from datetime import datetime, timedelta
 
@@ -278,11 +280,75 @@ def get_ordenes_completadas_periodo(fecha_inicio, fecha_fin):
 
 
 @st.cache_data(ttl=60, show_spinner=False)
+def get_ordenes_por_ids(ids):
+    """Órdenes de fabricación por id (para reabrir un proyecto guardado, sin importar su fecha)."""
+    if not ids:
+        return pd.DataFrame()
+    uid, models = conectar_odoo()
+    campo_fin = primer_campo_valido("mrp.production", ["date_finished", "date_planned_finished"])
+    campos = ["name", "product_id", "product_qty", "qty_producing", "state", "bom_id"]
+    if campo_fin:
+        campos.append(campo_fin)
+    data = buscar_leer(models, uid, "mrp.production", [("id", "in", list(ids))], campos)
+    df = pd.DataFrame(data)
+    if df.empty:
+        return df
+    df["date_finished"] = df[campo_fin] if campo_fin and campo_fin in df.columns else None
+    return df
+
+
+# Los proyectos (nombre + órdenes que los componen) se guardan en Odoo como un archivo
+# adjunto JSON, así sobreviven a los reinicios de Streamlit y no se necesita ninguna cuenta extra.
+NOMBRE_ARCHIVO_PROYECTOS = "marva_dashboard_proyectos.json"
+
+
+def cargar_proyectos():
+    uid, models = conectar_odoo()
+    res = models.execute_kw(
+        ODOO_DB, uid, ODOO_PASSWORD, "ir.attachment", "search_read",
+        [[("name", "=", NOMBRE_ARCHIVO_PROYECTOS)]], {"fields": ["id", "datas"], "limit": 1},
+    )
+    if not res or not res[0].get("datas"):
+        return {}
+    return json.loads(base64.b64decode(res[0]["datas"]).decode("utf-8"))
+
+
+def guardar_proyectos(proyectos):
+    uid, models = conectar_odoo()
+    contenido = base64.b64encode(json.dumps(proyectos, ensure_ascii=False, indent=1).encode("utf-8")).decode("ascii")
+    existentes = models.execute_kw(
+        ODOO_DB, uid, ODOO_PASSWORD, "ir.attachment", "search",
+        [[("name", "=", NOMBRE_ARCHIVO_PROYECTOS)]], {"limit": 1},
+    )
+    if existentes:
+        models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "ir.attachment", "write", [existentes, {"datas": contenido}])
+    else:
+        models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD, "ir.attachment", "create",
+            [{"name": NOMBRE_ARCHIVO_PROYECTOS, "datas": contenido, "mimetype": "application/json", "type": "binary"}],
+        )
+
+
+def _a_fecha(serie):
+    """Odoo manda False en las fechas vacías; esto las convierte a NaT sin truenes."""
+    return pd.to_datetime(serie.apply(lambda x: x if isinstance(x, str) else None), errors="coerce")
+
+
+@st.cache_data(ttl=60, show_spinner=False)
 def get_centros_trabajo():
     uid, models = conectar_odoo()
-    campos = ["name", "costs_hour", "working_state"]
+    disponibles = campos_disponibles("mrp.workcenter")
+    campo_empleado = primer_campo_valido("mrp.workcenter", ["employee_costs_hour"])
+    campos = [c for c in ["name", "costs_hour", "working_state"] if c in disponibles]
+    if campo_empleado:
+        campos.append(campo_empleado)
     data = buscar_leer(models, uid, "mrp.workcenter", [], campos)
-    return pd.DataFrame(data)
+    df = pd.DataFrame(data)
+    if df.empty:
+        return df
+    # Nombre estándar: costs_hour = costo por hora de MÁQUINA; employee_costs_hour = costo por hora del OPERADOR
+    df["employee_costs_hour"] = df[campo_empleado] if campo_empleado else 0.0
+    return df
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -494,7 +560,9 @@ def get_costo_planeado_materiales(df_ordenes):
 
 
 def get_costo_mano_obra(df_workorders, df_centros):
-    """Costo real de mano de obra: minutos reales / 60 * costo-hora del centro de trabajo."""
+    """Costo real por orden, separado en operador y máquina:
+    minutos reales / 60 × costo-hora del empleado (mano de obra) y × costo-hora de la máquina.
+    Regresa por orden: costo_mano_obra, costo_maquina, horas_trabajadas."""
     if df_workorders.empty or df_centros.empty:
         return pd.DataFrame()
     wo = df_workorders.copy()
@@ -502,10 +570,23 @@ def get_costo_mano_obra(df_workorders, df_centros):
     wo["orden_id"] = wo["production_id"].apply(lambda x: x[0] if isinstance(x, (list, tuple)) else x)
     wo["orden"] = wo["production_id"].apply(nombre_relacion)
 
-    centros = df_centros.rename(columns={"id": "centro_id", "costs_hour": "costo_hora"})[["centro_id", "costo_hora"]]
+    centros = df_centros.rename(columns={
+        "id": "centro_id", "costs_hour": "costo_hora_maquina", "employee_costs_hour": "costo_hora_empleado",
+    })
+    for col in ["costo_hora_maquina", "costo_hora_empleado"]:
+        if col not in centros.columns:
+            centros[col] = 0.0
+    centros = centros[["centro_id", "costo_hora_maquina", "costo_hora_empleado"]]
     wo = wo.merge(centros, on="centro_id", how="left")
-    wo["costo_mano_obra"] = (wo["duration"] / 60.0) * wo["costo_hora"].fillna(0)
-    return wo.groupby(["orden_id", "orden"]).agg(costo_mano_obra=("costo_mano_obra", "sum")).reset_index()
+    horas = wo["duration"].fillna(0) / 60.0
+    wo["costo_mano_obra"] = horas * wo["costo_hora_empleado"].fillna(0)
+    wo["costo_maquina"] = horas * wo["costo_hora_maquina"].fillna(0)
+    wo["horas_trabajadas"] = horas
+    return wo.groupby(["orden_id", "orden"]).agg(
+        costo_mano_obra=("costo_mano_obra", "sum"),
+        costo_maquina=("costo_maquina", "sum"),
+        horas_trabajadas=("horas_trabajadas", "sum"),
+    ).reset_index()
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -607,7 +688,8 @@ df_costo_mo = get_costo_mano_obra(df_workorders, df_centros)
 
 costo_material_planeado_total = df_costo_planeado["costo_planeado"].sum() if not df_costo_planeado.empty else 0
 costo_mano_obra_total = df_costo_mo["costo_mano_obra"].sum() if not df_costo_mo.empty else 0
-costo_total_produccion = costo_material_planeado_total + costo_mano_obra_total
+costo_maquina_total = df_costo_mo["costo_maquina"].sum() if not df_costo_mo.empty else 0
+costo_total_produccion = costo_material_planeado_total + costo_mano_obra_total + costo_maquina_total
 componentes_sin_costo = int((df_diagnostico_bom["Costo Unitario en Odoo"].fillna(0) == 0).sum()) if not df_diagnostico_bom.empty else 0
 
 # ---------- KPIs ----------
@@ -618,18 +700,19 @@ k3.metric("Órdenes atrasadas", len(df_atrasadas))
 k4.metric("Terminadas hoy", len(df_terminadas_hoy))
 k5.metric("Alertas de calidad abiertas", len(df_calidad))
 
-k6, k7, k8, k9 = st.columns(4)
+k6, k7, k8, k9, k10 = st.columns(5)
 k6.metric("Costo materiales (BOM)", f"${costo_material_planeado_total:,.0f}")
 k7.metric("Costo mano de obra (real)", f"${costo_mano_obra_total:,.0f}")
-k8.metric("Costo total de producción", f"${costo_total_produccion:,.0f}")
-k9.metric("Componentes sin costo en Odoo", f"{componentes_sin_costo} de {len(df_diagnostico_bom)}" if not df_diagnostico_bom.empty else "0 de 0")
+k8.metric("Costo maquinaria (real)", f"${costo_maquina_total:,.0f}")
+k9.metric("Costo total de producción", f"${costo_total_produccion:,.0f}")
+k10.metric("Componentes sin costo", f"{componentes_sin_costo} de {len(df_diagnostico_bom)}" if not df_diagnostico_bom.empty else "0 de 0")
 
 st.divider()
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab_proyectos, tab8 = st.tabs([
     "📋 Órdenes en piso", "⚙️ Centros de trabajo", "⏱️ Horas y avance",
     "💰 Costos", "✅ Calidad", "📦 Terminadas hoy", "📊 Acumulado por periodo",
-    "📈 Análisis",
+    "🏗️ Proyectos", "📈 Análisis",
 ])
 
 # ---------- TAB 1: Órdenes en piso ----------
@@ -684,7 +767,7 @@ with tab2:
 
         if not df_centros.empty:
             st.dataframe(
-                df_centros.rename(columns={"name": "Centro", "costs_hour": "Costo/Hora", "working_state": "Estado Actual"}),
+                df_centros.rename(columns={"name": "Centro", "costs_hour": "Costo/Hora Máquina", "employee_costs_hour": "Costo/Hora Operador", "working_state": "Estado Actual"}),
                 use_container_width=True, hide_index=True,
             )
 
@@ -718,8 +801,8 @@ with tab4:
     st.subheader("Costo de producción por orden")
     st.caption(
         "Materiales = costo estimado según la receta (BOM) de cada producto, ya que el "
-        "inventario real se controla en otro sistema. Mano de obra = horas reales del "
-        "workorder × costo-hora del centro de trabajo (máquina + operador) configurado en Odoo."
+        "inventario real se controla en otro sistema. Mano de obra = horas reales × costo-hora "
+        "del operador; Maquinaria = horas reales × costo-hora de la máquina (ambos del centro de trabajo en Odoo)."
     )
 
     with st.expander("🔍 Diagnóstico: costo unitario que el dashboard está leyendo de cada componente"):
@@ -736,7 +819,10 @@ with tab4:
         if not df_costo_mo.empty:
             resumen = resumen.merge(df_costo_mo, on=["orden_id", "orden"], how="outer")
         resumen = resumen.fillna(0)
-        resumen["costo_total"] = resumen.get("costo_planeado", 0) + resumen.get("costo_mano_obra", 0)
+        for col in ["costo_planeado", "costo_mano_obra", "costo_maquina"]:
+            if col not in resumen.columns:
+                resumen[col] = 0.0
+        resumen["costo_total"] = resumen["costo_planeado"] + resumen["costo_mano_obra"] + resumen["costo_maquina"]
 
         if not df_ordenes.empty:
             piezas = df_ordenes[["id", "qty_producing"]].rename(columns={"id": "orden_id"})
@@ -748,19 +834,23 @@ with tab4:
 
         tabla_costos = resumen.rename(columns={
             "orden": "Orden", "costo_planeado": "Materiales (BOM)",
-            "costo_mano_obra": "Mano de Obra", "costo_total": "Costo Total",
+            "costo_mano_obra": "Mano de Obra", "costo_maquina": "Maquinaria",
+            "horas_trabajadas": "Horas Trabajadas", "costo_total": "Costo Total",
             "qty_producing": "Piezas Producidas", "costo_por_pieza": "Costo por Pieza",
         }).drop(columns=["orden_id"], errors="ignore")
         st.dataframe(tabla_costos, use_container_width=True, hide_index=True)
 
-        st.markdown("**Desglose de mano de obra por centro de trabajo**")
+        st.markdown("**Desglose de costo de operación por centro de trabajo (operador + máquina)**")
         if not df_workorders.empty and not df_centros.empty:
             wo = df_workorders.copy()
             wo["Centro"] = wo["workcenter_id"].apply(nombre_relacion)
-            centros_costo = df_centros.rename(columns={"id": "centro_id", "costs_hour": "costo_hora"})
+            centros_costo = df_centros.rename(columns={"id": "centro_id", "costs_hour": "costo_hora_maquina", "employee_costs_hour": "costo_hora_empleado"})
+            for col in ["costo_hora_maquina", "costo_hora_empleado"]:
+                if col not in centros_costo.columns:
+                    centros_costo[col] = 0.0
             wo["centro_id"] = wo["workcenter_id"].apply(lambda x: x[0] if isinstance(x, (list, tuple)) else x)
-            wo = wo.merge(centros_costo[["centro_id", "costo_hora"]], on="centro_id", how="left")
-            wo["costo"] = (wo["duration"] / 60.0) * wo["costo_hora"].fillna(0)
+            wo = wo.merge(centros_costo[["centro_id", "costo_hora_maquina", "costo_hora_empleado"]], on="centro_id", how="left")
+            wo["costo"] = (wo["duration"] / 60.0) * (wo["costo_hora_maquina"].fillna(0) + wo["costo_hora_empleado"].fillna(0))
             por_centro = wo.groupby("Centro").agg(
                 horas_reales=("duration", lambda s: s.sum() / 60.0), costo=("costo", "sum")
             ).reset_index()
@@ -848,16 +938,16 @@ with tab7:
 
         total_mat = costo_mat_periodo["costo_planeado"].sum() if not costo_mat_periodo.empty else 0
         total_mo = costo_mo_periodo["costo_mano_obra"].sum() if not costo_mo_periodo.empty else 0
-        total_costo = total_mat + total_mo
+        total_maq = costo_mo_periodo["costo_maquina"].sum() if not costo_mo_periodo.empty else 0
+        total_costo = total_mat + total_mo + total_maq
         total_piezas = df_periodo["qty_producing"].sum()
-        costo_pieza_prom = (total_costo / total_piezas) if total_piezas else 0
 
         p1, p2, p3, p4, p5 = st.columns(5)
         p1.metric("Órdenes cerradas", len(df_periodo))
         p2.metric("Piezas producidas", f"{total_piezas:,.0f}")
         p3.metric("Costo materiales (BOM)", f"${total_mat:,.0f}")
         p4.metric("Costo mano de obra", f"${total_mo:,.0f}")
-        p5.metric("Costo por pieza (prom.)", f"${costo_pieza_prom:,.2f}" if total_piezas else "N/A")
+        p5.metric("Costo maquinaria", f"${total_maq:,.0f}")
 
         st.markdown(f"**Costo total del periodo: ${total_costo:,.0f}**")
 
@@ -877,6 +967,216 @@ with tab7:
         resumen_dia = por_dia.groupby("Día").agg(piezas=("qty_producing", "sum"), ordenes=("name", "count")).reset_index()
         fig_dia = px.bar(resumen_dia, x="Día", y="piezas", title="Piezas producidas por día")
         st.plotly_chart(estilizar_grafica(fig_dia), use_container_width=True, key="grafica_piezas_por_dia_periodo")
+
+# ---------- TAB Proyectos ----------
+with tab_proyectos:
+    st.subheader("Proyectos")
+    st.caption(
+        "Agrupa órdenes de fabricación **terminadas** en un proyecto (ej. una cimentación elevada) y ve el "
+        "costo y el tiempo reales de cada línea y del total. Todo sale de las órdenes en Odoo."
+    )
+
+    hoy_p = datetime.now().date()
+
+    # --- Cargar proyectos guardados (una vez por sesión) ---
+    if "proyectos" not in st.session_state:
+        try:
+            st.session_state["proyectos"] = cargar_proyectos()
+            st.session_state["proyectos_error"] = ""
+        except Exception as e:
+            st.session_state["proyectos"] = {}
+            st.session_state["proyectos_error"] = str(e)
+    proyectos = st.session_state["proyectos"]
+    if st.session_state.get("proyectos_error"):
+        st.warning(f"No pude leer los proyectos guardados en Odoo: {st.session_state['proyectos_error'][:200]}")
+
+    # --- Crear proyecto nuevo ---
+    col_n1, col_n2 = st.columns([4, 1])
+    nuevo_nombre = col_n1.text_input("Nuevo proyecto", placeholder="Ej. 1-2-6 Cimentación elevada de silo", key="nuevo_proyecto_nombre")
+    col_n2.write("")
+    if col_n2.button("➕ Crear", key="btn_crear_proyecto", use_container_width=True):
+        nombre_limpio = nuevo_nombre.strip()
+        if not nombre_limpio:
+            st.warning("Escribe un nombre para el proyecto.")
+        elif nombre_limpio in proyectos:
+            st.warning("Ya existe un proyecto con ese nombre.")
+        else:
+            proyectos[nombre_limpio] = {"ordenes": [], "creado": str(hoy_p)}
+            try:
+                guardar_proyectos(proyectos)
+            except Exception as e:
+                st.error(f"El proyecto quedó solo en esta sesión; no se pudo guardar en Odoo: {str(e)[:200]}")
+            st.session_state["proyecto_activo"] = nombre_limpio
+
+    if not proyectos:
+        st.info("Todavía no hay proyectos. Crea el primero arriba.")
+    else:
+        activo = st.selectbox("Proyecto", sorted(proyectos.keys()), key="proyecto_activo")
+        guardadas = [int(i) for i in proyectos[activo].get("ordenes", [])]
+
+        dias_busqueda = st.selectbox(
+            "Buscar órdenes terminadas de los últimos…", [30, 90, 180, 365, 730], index=3,
+            format_func=lambda d: f"{d} días", key="proyecto_dias_busqueda",
+        )
+        df_pool = intentar(get_ordenes_completadas_periodo, hoy_p - timedelta(days=dias_busqueda), hoy_p, etiqueta="las órdenes terminadas")
+        df_guardadas = intentar(get_ordenes_por_ids, guardadas, etiqueta="las órdenes del proyecto") if guardadas else pd.DataFrame()
+        marcos = [d for d in [df_pool, df_guardadas] if not d.empty]
+        base_ordenes = pd.concat(marcos, ignore_index=True).drop_duplicates(subset="id") if marcos else pd.DataFrame()
+
+        if base_ordenes.empty:
+            st.info("No hay órdenes terminadas en ese periodo para agregar al proyecto.")
+        else:
+            etiquetas = {}
+            for _, r in base_ordenes.iterrows():
+                fecha_txt = r["date_finished"][:10] if isinstance(r.get("date_finished"), str) else ""
+                etiquetas[int(r["id"])] = f"{r['name']} · {nombre_relacion(r['product_id'])} · {r['product_qty']:g} pz · {fecha_txt}"
+
+            clave_sel = f"sel_ordenes_{activo}"
+            if clave_sel not in st.session_state:
+                st.session_state[clave_sel] = [i for i in guardadas if i in etiquetas]
+            seleccion = st.multiselect(
+                "Órdenes de fabricación que componen el proyecto",
+                sorted(etiquetas.keys(), key=lambda i: etiquetas[i]),
+                key=clave_sel, format_func=lambda i: etiquetas.get(i, str(i)),
+            )
+
+            if not seleccion:
+                st.info("Selecciona las órdenes que componen este proyecto; los totales se calculan al ir agregando.")
+            else:
+                df_sel = base_ordenes[base_ordenes["id"].isin(seleccion)].copy()
+                wo_sel = intentar(get_workorders, list(seleccion), etiqueta="las operaciones del proyecto")
+                try:
+                    costo_mat_sel, _ = get_costo_planeado_materiales(df_sel)
+                except Exception as e:
+                    st.warning(f"No se pudo calcular el costo de materiales: {e}")
+                    costo_mat_sel = pd.DataFrame()
+                costo_op_sel = get_costo_mano_obra(wo_sel, df_centros)
+
+                t = df_sel[["id", "name", "product_id", "product_qty", "qty_producing"]].copy()
+                t["Producto"] = t["product_id"].apply(nombre_relacion)
+                t["Piezas"] = t["qty_producing"].where(t["qty_producing"] > 0, t["product_qty"])
+                if not costo_mat_sel.empty:
+                    t = t.merge(costo_mat_sel[["id", "costo_planeado"]], on="id", how="left")
+                else:
+                    t["costo_planeado"] = 0.0
+                if not costo_op_sel.empty:
+                    t = t.merge(
+                        costo_op_sel.rename(columns={"orden_id": "id"})[["id", "costo_mano_obra", "costo_maquina", "horas_trabajadas"]],
+                        on="id", how="left",
+                    )
+                else:
+                    t["costo_mano_obra"] = 0.0
+                    t["costo_maquina"] = 0.0
+                    t["horas_trabajadas"] = 0.0
+                if not wo_sel.empty:
+                    w = wo_sel.copy()
+                    w["id"] = w["production_id"].apply(lambda x: x[0] if isinstance(x, (list, tuple)) else x)
+                    w["ini"] = _a_fecha(w["date_start"])
+                    w["fin"] = _a_fecha(w["date_finished"])
+                    fechas = w.groupby("id").agg(Inicio=("ini", "min"), Fin=("fin", "max")).reset_index()
+                    t = t.merge(fechas, on="id", how="left")
+                else:
+                    t["Inicio"] = pd.NaT
+                    t["Fin"] = pd.NaT
+                for col in ["costo_planeado", "costo_mano_obra", "costo_maquina", "horas_trabajadas"]:
+                    t[col] = t[col].fillna(0.0)
+                t["costo_total"] = t["costo_planeado"] + t["costo_mano_obra"] + t["costo_maquina"]
+                t["costo_pieza"] = t.apply(lambda r: r["costo_total"] / r["Piezas"] if r["Piezas"] > 0 else None, axis=1)
+                t = t.sort_values("Inicio", na_position="last")
+
+                # --- Totales del proyecto ---
+                tot_mo = t["costo_mano_obra"].sum()
+                tot_maq = t["costo_maquina"].sum()
+                tot_mat = t["costo_planeado"].sum()
+                tot_costo = tot_mo + tot_maq + tot_mat
+                tot_horas = t["horas_trabajadas"].sum()
+
+                m1, m2, m3, m4, m5 = st.columns(5)
+                m1.metric("Mano de obra", f"${tot_mo:,.0f}")
+                m2.metric("Maquinaria", f"${tot_maq:,.0f}")
+                m3.metric("Materiales", f"${tot_mat:,.0f}")
+                m4.metric("Costo total del proyecto", f"${tot_costo:,.0f}")
+                m5.metric("Horas trabajadas", f"{tot_horas:,.1f} h")
+
+                # --- Tabla por línea + fila de totales ---
+                tabla_p = pd.DataFrame({
+                    "Orden": t["name"], "Producto": t["Producto"], "Piezas": t["Piezas"],
+                    "Mano de obra": t["costo_mano_obra"], "Maquinaria": t["costo_maquina"],
+                    "Materiales": t["costo_planeado"], "Costo total": t["costo_total"],
+                    "Costo por pieza": t["costo_pieza"], "Horas trabajadas": t["horas_trabajadas"],
+                    "Inicio": t["Inicio"].dt.strftime("%Y-%m-%d").fillna(""),
+                    "Fin": t["Fin"].dt.strftime("%Y-%m-%d").fillna(""),
+                })
+                fila_total = pd.DataFrame([{
+                    "Orden": "TOTAL DEL PROYECTO", "Producto": "", "Piezas": None,
+                    "Mano de obra": tot_mo, "Maquinaria": tot_maq, "Materiales": tot_mat,
+                    "Costo total": tot_costo, "Costo por pieza": None, "Horas trabajadas": tot_horas,
+                    "Inicio": t["Inicio"].min().strftime("%Y-%m-%d") if t["Inicio"].notna().any() else "",
+                    "Fin": t["Fin"].max().strftime("%Y-%m-%d") if t["Fin"].notna().any() else "",
+                }])
+                tabla_final = pd.concat([tabla_p, fila_total], ignore_index=True)
+                columnas_dinero = ["Mano de obra", "Maquinaria", "Materiales", "Costo total", "Costo por pieza"]
+                config_cols = {c: st.column_config.NumberColumn(c, format="$%.2f") for c in columnas_dinero}
+                config_cols["Piezas"] = st.column_config.NumberColumn("Piezas", format="%.0f")
+                config_cols["Horas trabajadas"] = st.column_config.NumberColumn("Horas trabajadas", format="%.1f")
+                st.dataframe(tabla_final, use_container_width=True, hide_index=True, column_config=config_cols)
+
+                st.markdown(
+                    f"**Resumen:** mano de obra ${tot_mo:,.0f} · maquinaria ${tot_maq:,.0f} · materiales ${tot_mat:,.0f} "
+                    f"→ **total ${tot_costo:,.0f}** en **{tot_horas:,.1f} horas trabajadas**."
+                )
+                st.caption("El costo por pieza solo tiene sentido dentro de cada línea (mismo producto); por eso la fila de totales no lo promedia.")
+
+                # --- Gráfica de costo por línea ---
+                largo = tabla_p[["Orden", "Mano de obra", "Maquinaria", "Materiales"]].melt(
+                    id_vars="Orden", var_name="Concepto", value_name="Costo")
+                fig_proy = px.bar(
+                    largo, x="Orden", y="Costo", color="Concepto", barmode="stack",
+                    title="Costo por línea del proyecto",
+                    color_discrete_map={"Mano de obra": COLOR_PRIMARIO, "Maquinaria": "#4A7FA6", "Materiales": "#7FA65C"},
+                )
+                st.plotly_chart(estilizar_grafica(fig_proy), use_container_width=True, key="grafica_proyecto_costos")
+
+                # --- Avisos de datos incompletos ---
+                col_emp = df_centros.get("employee_costs_hour") if not df_centros.empty else None
+                if col_emp is None or (col_emp.fillna(0) == 0).all():
+                    st.warning("Los centros de trabajo no traen costo por hora del operador (o está en $0); por eso la mano de obra sale en $0.")
+                sin_mat = t.loc[t["costo_planeado"] <= 0, "name"].tolist()
+                if sin_mat:
+                    st.warning("Materiales en $0 en: " + ", ".join(sin_mat) + " (sin receta BOM o con componentes sin costo en Odoo).")
+                sin_horas = t.loc[t["horas_trabajadas"] <= 0, "name"].tolist()
+                if sin_horas:
+                    st.warning("Sin horas registradas en: " + ", ".join(sin_horas) + " (no se registró tiempo en sus operaciones).")
+
+            # --- Acciones ---
+            acc1, acc2, acc3 = st.columns(3)
+            if acc1.button("💾 Guardar proyecto", key="btn_guardar_proyecto", use_container_width=True):
+                proyectos[activo]["ordenes"] = [int(i) for i in seleccion]
+                proyectos[activo]["actualizado"] = str(hoy_p)
+                try:
+                    guardar_proyectos(proyectos)
+                    st.success("Proyecto guardado en Odoo.")
+                except Exception as e:
+                    st.error(f"No se pudo guardar en Odoo: {str(e)[:200]}")
+            if seleccion:
+                acc2.download_button(
+                    "⬇️ Descargar tabla (CSV)", data=tabla_final.to_csv(index=False).encode("utf-8-sig"),
+                    file_name=f"proyecto_{activo}.csv".replace(" ", "_"), mime="text/csv",
+                    key="btn_descargar_proyecto", use_container_width=True,
+                )
+
+        with st.expander("🗑️ Eliminar este proyecto"):
+            confirmar = st.checkbox(f"Sí, eliminar «{activo}» (las órdenes en Odoo no se tocan)", key="confirmar_eliminar_proyecto")
+            if st.button("Eliminar proyecto", key="btn_eliminar_proyecto", disabled=not confirmar):
+                proyectos.pop(activo, None)
+                try:
+                    guardar_proyectos(proyectos)
+                except Exception as e:
+                    st.error(f"No se pudo actualizar en Odoo: {str(e)[:200]}")
+                st.session_state.pop("proyecto_activo", None)
+                st.session_state.pop(f"sel_ordenes_{activo}", None)
+                st.session_state.pop("confirmar_eliminar_proyecto", None)
+                st.rerun()
 
 # ---------- TAB 8: Análisis ----------
 with tab8:
