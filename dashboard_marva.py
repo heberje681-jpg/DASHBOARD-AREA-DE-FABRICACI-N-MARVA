@@ -23,6 +23,7 @@ Uso:
 
 import base64
 import json
+import threading
 import xmlrpc.client
 from datetime import datetime, timedelta
 
@@ -143,12 +144,25 @@ ODOO_PASSWORD = _get_config("ODOO_PASSWORD", "")
 # CONEXIÓN A ODOO
 # ============================================================
 @st.cache_resource(show_spinner="Conectando con Odoo...")
-def conectar_odoo():
+def _autenticar_odoo():
+    """Solo el uid se comparte entre sesiones; la conexión HTTP NO (no es segura entre hilos)."""
     common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
     uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_PASSWORD, {})
     if not uid:
         raise ConnectionError("No se pudo autenticar en Odoo. Revisa usuario/contraseña/DB.")
-    models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
+    return uid
+
+
+_conexion_hilo = threading.local()
+
+
+def conectar_odoo():
+    """Cada hilo (cada sesión abierta) usa su propia conexión; compartirla causa errores 'Request-sent'."""
+    uid = _autenticar_odoo()
+    models = getattr(_conexion_hilo, "models", None)
+    if models is None:
+        models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
+        _conexion_hilo.models = models
     return uid, models
 
 
@@ -979,22 +993,24 @@ with tab_proyectos:
     hoy_p = datetime.now().date()
 
     # --- Cargar proyectos guardados (una vez por sesión) ---
+    error_lectura = ""
     if "proyectos" not in st.session_state:
         try:
             st.session_state["proyectos"] = cargar_proyectos()
-            st.session_state["proyectos_error"] = ""
         except Exception as e:
-            st.session_state["proyectos"] = {}
-            st.session_state["proyectos_error"] = str(e)
-    proyectos = st.session_state["proyectos"]
-    if st.session_state.get("proyectos_error"):
-        st.warning(f"No pude leer los proyectos guardados en Odoo: {st.session_state['proyectos_error'][:200]}")
+            error_lectura = str(e)
+    proyectos = st.session_state.get("proyectos")
+    if proyectos is None:
+        # No se pudo leer: no se muestra nada editable para no sobrescribir los proyectos ya guardados.
+        st.warning(f"No pude leer los proyectos guardados en Odoo: {error_lectura[:200]}")
+        st.button("🔄 Reintentar", key="btn_reintentar_proyectos")
+        proyectos = None
 
     # --- Crear proyecto nuevo ---
     col_n1, col_n2 = st.columns([4, 1])
-    nuevo_nombre = col_n1.text_input("Nuevo proyecto", placeholder="Ej. 1-2-6 Cimentación elevada de silo", key="nuevo_proyecto_nombre")
+    nuevo_nombre = col_n1.text_input("Nuevo proyecto", placeholder="Ej. 1-2-6 Cimentación elevada de silo", key="nuevo_proyecto_nombre", disabled=proyectos is None)
     col_n2.write("")
-    if col_n2.button("➕ Crear", key="btn_crear_proyecto", use_container_width=True):
+    if col_n2.button("➕ Crear", key="btn_crear_proyecto", use_container_width=True, disabled=proyectos is None):
         nombre_limpio = nuevo_nombre.strip()
         if not nombre_limpio:
             st.warning("Escribe un nombre para el proyecto.")
@@ -1008,7 +1024,9 @@ with tab_proyectos:
                 st.error(f"El proyecto quedó solo en esta sesión; no se pudo guardar en Odoo: {str(e)[:200]}")
             st.session_state["proyecto_activo"] = nombre_limpio
 
-    if not proyectos:
+    if proyectos is None:
+        pass
+    elif not proyectos:
         st.info("Todavía no hay proyectos. Crea el primero arriba.")
     else:
         activo = st.selectbox("Proyecto", sorted(proyectos.keys()), key="proyecto_activo")
